@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -56,12 +57,98 @@ class ChatStreamWorker(QObject):
                 self.error.emit(str(exc))
 
 
+class CharacterSelectDialog(QDialog):
+    def __init__(
+        self,
+        parent: QWidget,
+        character_provider: Callable[[], list[dict[str, Any]]],
+        current_ai: dict[str, Any] | None = None,
+        current_self: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("选择对话角色")
+        self.setModal(True)
+        self.resize(380, 220)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 20, 20, 20)
+        root.setSpacing(14)
+
+        self_label = QLabel("你扮演的角色")
+        self_label.setObjectName("SectionLabel")
+        root.addWidget(self_label)
+        self.self_combo = QComboBox()
+        self.self_combo.setMinimumWidth(300)
+        root.addWidget(self.self_combo)
+
+        ai_label = QLabel("AI 扮演的角色")
+        ai_label.setObjectName("SectionLabel")
+        root.addWidget(ai_label)
+        self.ai_combo = QComboBox()
+        self.ai_combo.setMinimumWidth(300)
+        root.addWidget(self.ai_combo)
+
+        characters = character_provider()
+        char_list: list[dict[str, Any]] = list(characters) if characters else []
+
+        self_ai_id = self._char_id(current_ai)
+        self_self_id = self._char_id(current_self)
+
+        self.self_combo.addItem("我（作者本人）", None)
+        self.ai_combo.addItem("写作助手", None)
+
+        self_sel_idx = 0
+        ai_sel_idx = 0
+        for i, ch in enumerate(char_list):
+            name = str(ch.get("name", "") or "").strip()
+            if not name:
+                continue
+            role = str(ch.get("role", "") or "").strip()
+            label = f"{name} · {role}" if role else name
+            item_data = dict(ch)
+            self.self_combo.addItem(label, item_data)
+            self.ai_combo.addItem(label, item_data)
+            cid = int(ch.get("id", 0) or 0)
+            if cid == self_self_id:
+                self_sel_idx = self.self_combo.count() - 1
+            if cid == self_ai_id:
+                ai_sel_idx = self.ai_combo.count() - 1
+
+        self.self_combo.setCurrentIndex(self_sel_idx)
+        self.ai_combo.setCurrentIndex(ai_sel_idx)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel_btn = QPushButton("取消")
+        ok_btn = QPushButton("确认")
+        ok_btn.setDefault(True)
+        cancel_btn.clicked.connect(self.reject)
+        ok_btn.clicked.connect(self.accept)
+        buttons.addWidget(cancel_btn)
+        buttons.addWidget(ok_btn)
+        root.addLayout(buttons)
+
+    @staticmethod
+    def _char_id(data: dict[str, Any] | None) -> int:
+        if not data:
+            return 0
+        return int(data.get("id", 0) or 0)
+
+    def selected_ai(self) -> dict[str, Any] | None:
+        data = self.ai_combo.currentData()
+        return dict(data) if isinstance(data, dict) else None
+
+    def selected_self(self) -> dict[str, Any] | None:
+        data = self.self_combo.currentData()
+        return dict(data) if isinstance(data, dict) else None
+
+
 class ChatDialog(QDialog):
     def __init__(
         self,
         parent: QWidget,
         ai_service: SimpleAIService,
-        context_builder: Callable[[dict[str, Any] | None], str],
+        context_builder: Callable[[dict[str, Any] | None, dict[str, Any] | None, str], str],
         character_provider: Callable[[], list[dict[str, Any]]] | None = None,
     ) -> None:
         super().__init__(parent)
@@ -71,6 +158,8 @@ class ChatDialog(QDialog):
         self.ai_service = ai_service
         self.context_builder = context_builder
         self.character_provider = character_provider
+        self.self_character: dict[str, Any] | None = None
+        self.ai_character: dict[str, Any] | None = None
         self.chat_history: list[dict[str, str]] = []
         self.current_thread: QThread | None = None
         self.current_worker: ChatStreamWorker | None = None
@@ -82,15 +171,6 @@ class ChatDialog(QDialog):
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 16, 16, 16)
         root.setSpacing(12)
-
-        role_row = QHBoxLayout()
-        role_row.addWidget(QLabel("对话身份"))
-        self.character_combo = QComboBox()
-        self.character_combo.setMinimumWidth(220)
-        self.character_combo.currentIndexChanged.connect(self._on_character_changed)
-        role_row.addWidget(self.character_combo, 1)
-        root.addLayout(role_row)
-        self.refresh_characters()
 
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
@@ -114,6 +194,11 @@ class ChatDialog(QDialog):
         input_layout.addWidget(self.input_editor)
 
         buttons = QHBoxLayout()
+        self.role_btn = QPushButton("选择角色")
+        self.role_btn.setToolTip("设置你扮演的角色和 AI 扮演的角色")
+        self.role_btn.clicked.connect(self._open_character_select)
+        self.role_label = QLabel("写作助手")
+        self.role_label.setObjectName("MetaLabel")
         clear_btn = QPushButton("清空历史")
         self.cancel_btn = QPushButton("取消回复")
         self.send_btn = QPushButton("发送")
@@ -121,6 +206,8 @@ class ChatDialog(QDialog):
         self.cancel_btn.clicked.connect(self.cancel_reply)
         self.send_btn.clicked.connect(self.send_message)
         self.cancel_btn.setEnabled(False)
+        buttons.addWidget(self.role_btn)
+        buttons.addWidget(self.role_label)
         buttons.addWidget(clear_btn)
         buttons.addStretch(1)
         buttons.addWidget(self.cancel_btn)
@@ -135,33 +222,36 @@ class ChatDialog(QDialog):
     def update_ai_service(self, ai_service: SimpleAIService) -> None:
         self.ai_service = ai_service
 
+    def _open_character_select(self) -> None:
+        if not self.character_provider:
+            return
+        dlg = CharacterSelectDialog(
+            self,
+            self.character_provider,
+            current_ai=self.ai_character,
+            current_self=self.self_character,
+        )
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            new_self = dlg.selected_self()
+            new_ai = dlg.selected_ai()
+            if new_self != self.self_character or new_ai != self.ai_character:
+                self.self_character = new_self
+                self.ai_character = new_ai
+                self._update_role_label()
+                self.clear_history()
+
+    def _update_role_label(self) -> None:
+        parts: list[str] = []
+        if self.self_character:
+            parts.append(f"你：{self.self_character.get('name', '作者')}")
+        if self.ai_character:
+            parts.append(f"「{self.ai_character.get('name', '助手')}」")
+        else:
+            parts.append("写作助手")
+        self.role_label.setText("  |  ".join(parts))
+
     def refresh_characters(self) -> None:
-        current_id = None
-        current_data = self.character_combo.currentData()
-        if isinstance(current_data, dict):
-            current_id = int(current_data.get("id", 0) or 0)
-        self.character_combo.blockSignals(True)
-        self.character_combo.clear()
-        self.character_combo.addItem("写作助手", None)
-        if self.character_provider:
-            for character in self.character_provider():
-                name = str(character.get("name", "") or "").strip()
-                if not name:
-                    continue
-                role = str(character.get("role", "") or "").strip()
-                label = f"{name} · {role}" if role else name
-                self.character_combo.addItem(label, dict(character))
-                if current_id and int(character.get("id", 0) or 0) == current_id:
-                    self.character_combo.setCurrentIndex(self.character_combo.count() - 1)
-        self.character_combo.blockSignals(False)
-
-    def _selected_character(self) -> dict[str, Any] | None:
-        data = self.character_combo.currentData()
-        return dict(data) if isinstance(data, dict) else None
-
-    def _on_character_changed(self) -> None:
-        if self.current_thread is None:
-            self.clear_history()
+        pass
 
     def eventFilter(self, obj, event) -> bool:
         from PyQt6.QtCore import QEvent
@@ -181,7 +271,7 @@ class ChatDialog(QDialog):
         self.current_ai_label = self._append_bubble("assistant", "")
         self.pending_text = ""
 
-        context = self.context_builder(self._selected_character()).strip()
+        context = self.context_builder(self.ai_character, self.self_character, text).strip()
         messages = []
         if context:
             messages.append({"role": "system", "content": context})
@@ -232,21 +322,21 @@ class ChatDialog(QDialog):
         bubble.setWordWrap(True)
         bubble.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         bubble.setObjectName("ChatUserBubble" if role == "user" else "ChatAssistantBubble")
-        bubble.setMinimumWidth(120)
-        bubble.setMaximumWidth(520)
+        bubble.setMinimumWidth(80)
         time_label = QLabel(datetime.now().strftime("%H:%M"))
         time_label.setObjectName("MetaLabel")
         box = QVBoxLayout()
-        box.addWidget(bubble)
+        box.addWidget(bubble, 1)
         box.addWidget(time_label, 0, Qt.AlignmentFlag.AlignRight if role == "user" else Qt.AlignmentFlag.AlignLeft)
         holder = QWidget()
+        holder.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         holder.setLayout(box)
         if role == "user":
-            row.addStretch(1)
-            row.addWidget(holder)
+            row.addStretch(2)
+            row.addWidget(holder, 3)
         else:
-            row.addWidget(holder)
-            row.addStretch(1)
+            row.addWidget(holder, 3)
+            row.addStretch(2)
         self.messages_layout.insertWidget(max(0, self.messages_layout.count() - 1), row_widget)
         QTimer.singleShot(0, self._scroll_to_bottom)
         return bubble

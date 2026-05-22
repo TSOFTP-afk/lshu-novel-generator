@@ -52,8 +52,10 @@ class TruthManager:
         path = self._truth_dir(book_id) / filename
         truncated = content.strip()
         if len(truncated.encode("utf-8")) > MAX_TRUTH_FILE_BYTES:
-            truncated = truncated[:MAX_TRUTH_FILE_BYTES]
-            truncated = truncated[: truncated.rfind("\n")]
+            truncated = truncated.encode("utf-8")[:MAX_TRUTH_FILE_BYTES].decode("utf-8", errors="ignore").rstrip()
+            newline_index = truncated.rfind("\n")
+            if newline_index > 0:
+                truncated = truncated[:newline_index].rstrip()
         path.write_text(truncated, encoding="utf-8")
 
     def read(self, book_id: int, filename: str) -> str:
@@ -75,7 +77,7 @@ class TruthManager:
 
         results: dict[str, str] = {}
 
-        current_state = self._build_current_state(book_title, book_outline, characters, chapters)
+        current_state = self._build_current_state(book_title, book_outline, characters, world_entries, chapters)
         self._write_file(book_id, "current_state.md", current_state)
         results["current_state.md"] = current_state
 
@@ -232,6 +234,7 @@ class TruthManager:
         book_title: str,
         book_outline: str,
         characters: list[Any],
+        world_entries: list[Any],
         chapters: list[Any],
     ) -> str:
         lines = [f"# {book_title} — 当前状态", ""]
@@ -254,6 +257,22 @@ class TruthManager:
                 if profile:
                     parts.append(f"：{profile[:200]}")
                 lines.append("".join(parts))
+            lines.append("")
+        if world_entries:
+            lines.append("## 世界观设定")
+            for we_row in world_entries[:30]:
+                item = dict(we_row) if not isinstance(we_row, dict) else we_row
+                name = str(item.get("name", "") or "").strip()
+                category = str(item.get("category", "") or "").strip()
+                content = str(item.get("content_text", "") or "").strip()
+                if not name:
+                    continue
+                label = f"- **{name}**"
+                if category:
+                    label += f"（{category}）"
+                if content:
+                    label += f"：{content[:300]}"
+                lines.append(label)
             lines.append("")
         if chapters:
             lines.append("## 章节进度")

@@ -1,0 +1,123 @@
+===============================================================================
+  灵枢 - 打包规则与维护手册
+===============================================================================
+
+  规则一：打包前强制清理所有历史缓存
+===============================================================================
+
+  问题背景：
+    旧的 build_first_exe_fast.ps1 使用 PowerShell 的 Remove-Item 清理
+    %TEMP%\*-release-build 目录。当目录包含数千个小文件（如 Python Lib）
+    时，Remove-Item 会卡死数分钟，导致构建失败或超时。
+
+  解决方案：
+    [System.IO.Directory]::Delete($path, $true)
+    .NET 的 Directory.Delete 比 Remove-Item 快 5-10 倍，且不受路径长度限制。
+
+  脚本位置（步骤 [0/6]）：
+    - 扫描 %TEMP% 下所有 *release-build 子目录
+    - 无条件全部删除
+    - 然后重新创建当前需要的构建目录
+    - 使用 try/catch 包裹单个删除操作，某目录被锁定时只发警告不中断
+
+
+  规则二：产物命名与项目名/版本号严格对齐
+===============================================================================
+
+  命名规范：
+    产物格式：{ProductName}-{Version}.exe
+    示例：    灵枢-v1.0.0.exe
+
+  参数默认值必须在脚本 param() 块中硬编码：
+    param(
+        [string]$Version = "v1.0.0",
+        [string]$ProductName = "灵枢"
+    )
+
+  版本号对齐要求：
+    每次发版前，请确认 RELEASE_灵枢.txt 中的版本号与脚本默认值一致。
+    不一致时应同时更新两处。
+
+  ***** 关键隐患：PowerShell 5.1 中文编码 *****
+
+    PowerShell 5.1 (Windows 内置) 在读取无 BOM 的 .ps1 文件时，
+    会将 UTF-8 编码的中文字符按系统 ANSI 编码（中文系统为 GBK）解释，
+    导致 "灵枢" 被错误解码为 "鐏垫灑" 写入磁盘。
+
+    后果：产物文件名、临时目录名、C# 配置常量全部乱码。
+
+    解决：脚本文件必须以 UTF-8 with BOM 编码保存。
+    Write-Output/Write-Host 对汉字不乱码，但文件路径操作会乱码。
+
+    验证方法（PowerShell 中执行）：
+      $bytes = [System.IO.File]::ReadAllBytes("build_first_exe_fast.ps1")
+      if ($bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+          Write-Output "BOM OK"
+      } else {
+          Write-Output "MISSING BOM - MUST FIX"
+      }
+
+  补充：LauncherConfig.cs 中的 AppName/Version 常量也由脚本动态注入，
+  因此参数正确性会直接传导到 C# 编译产物和最终 exe 文件属性中。
+
+
+  规则三：ICO 图标必须双路径嵌入
+===============================================================================
+
+  图标有两处需要设置，仅设一处则另一处显示默认 Windows 图标：
+
+  ┌──────────────────────────────────────────────────────────────────┐
+  │ A) 资源管理器中的 exe 图标（Explorer Icon）                       │
+  │    实现方式：C# 编译器参数 /win32icon:"path\to\app_icon.ico"      │
+  │    影响范围：桌面图标、文件管理器图标列、任务栏固定图标             │
+  ├──────────────────────────────────────────────────────────────────┤
+  │ B) 运行时的窗口左上角图标（Window Icon）                           │
+  │    实现方式：Python/Qt 代码在运行时加载 QIcon 设置到窗口            │
+  │    代码位置：novel_app/qt_app.py → _resolve_and_set_app_icon()     │
+  │    查找路径：{运行目录}/packaging/app_icon.ico                     │
+  │    影响范围：窗口标题栏左上角、任务栏缩略图（运行时）               │
+  └──────────────────────────────────────────────────────────────────┘
+
+  构建脚本必须在 [2/6] 步骤中将 app_icon.ico 复制到 payload：
+    $PayloadApp/packaging/app_icon.ico
+
+  这样 Python 运行时解压后能在 app/packaging/ 目录下找到图标文件，
+  _resolve_and_set_app_icon 中的 BASE_DIR / "packaging" / "app_icon.ico"
+  路径就能正确命中。
+
+  图标源文件管理：
+    - 原始 PNG：项目根目录的 image_*.png（用户提供的素材）
+    - ICO 文件：packaging/app_icon.ico（由 PNG 转换生成）
+    - 转换命令：
+        python -c "
+        from PIL import Image
+        img = Image.open(r'原始PNG路径')
+        sizes = [(256,256),(128,128),(64,64),(48,48),(32,32),(16,16)]
+        img.save(r'packaging\app_icon.ico', format='ICO', sizes=sizes)
+        "
+
+
+===============================================================================
+  附录：构建命令参考
+===============================================================================
+
+  默认构建（使用脚本内置的 ProductName 和 Version）：
+    powershell -ExecutionPolicy Bypass -File "packaging\build_first_exe_fast.ps1"
+
+  指定版本号构建：
+    powershell -ExecutionPolicy Bypass -File "packaging\build_first_exe_fast.ps1" `
+        -Version "v1.1.0"
+
+  指定运行时来源构建：
+    powershell -ExecutionPolicy Bypass -File "packaging\build_first_exe_fast.ps1" `
+        -ReuseRuntimeFrom "v1.2-preview"
+
+  产物输出位置：
+    release\{ProductName}-{Version}.exe
+
+
+===============================================================================
+  更新记录
+===============================================================================
+
+  2026-05-14  初版，基于 build_first_exe_fast.ps1 优化后整理

@@ -1,0 +1,11 @@
+$ErrorActionPreference = "Stop"
+$scriptPath = Join-Path $PSScriptRoot "packaging\build_first_exe_fast.ps1"
+$Version = "v1.3"
+$ProductName = "LingShu"
+$ReuseRuntimeFrom = "v1.3 preview"
+Write-Output "=== Build started ==="
+Write-Output "Script: $scriptPath"
+Write-Output "Version: $Version"
+Write-Output "ReuseRuntimeFrom: $ReuseRuntimeFrom"
+& $scriptPath -Version $Version -ProductName $ProductName -ReuseRuntimeFrom $ReuseRuntimeFrom
+Write-Output "=== Build finished ==="

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -9,9 +11,13 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSpinBox,
+    QSplitter,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -104,6 +110,10 @@ class AiSettingsDialog(QDialog):
         *,
         profiles: dict[str, dict[str, str | bool]],
         purpose_labels: list[tuple[str, str]],
+        request_retries: int = 2,
+        book_analysis_concurrency: int = 3,
+        book_analysis_fast_extra_body: str = "",
+        book_analysis_final_extra_body: str = "",
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("AI 设置")
@@ -140,6 +150,24 @@ class AiSettingsDialog(QDialog):
         unified_form.addRow("统一 API Key", self.unified_api_key)
         unified_form.addRow("统一 Base URL", self.unified_base_url)
         unified_form.addRow("统一模型", self.unified_model)
+        self.request_retries = QSpinBox()
+        self.request_retries.setRange(0, 5)
+        self.request_retries.setValue(max(0, min(5, int(request_retries))))
+        self.request_retries.setToolTip("AI 请求失败后的重试次数；0 表示不重试。")
+        unified_form.addRow("API 失败重试次数", self.request_retries)
+        self.book_analysis_concurrency = QSpinBox()
+        self.book_analysis_concurrency.setRange(1, 8)
+        self.book_analysis_concurrency.setValue(max(1, min(8, int(book_analysis_concurrency))))
+        self.book_analysis_concurrency.setToolTip("全书分析一级/二级同层并发请求数。")
+        unified_form.addRow("全书分析并发请求数", self.book_analysis_concurrency)
+        self.book_analysis_fast_extra_body = QPlainTextEdit(book_analysis_fast_extra_body)
+        self.book_analysis_fast_extra_body.setMinimumHeight(66)
+        self.book_analysis_fast_extra_body.setToolTip("一级/二级分析请求体额外 JSON 对象。")
+        unified_form.addRow("一级/二级额外请求参数 JSON", self.book_analysis_fast_extra_body)
+        self.book_analysis_final_extra_body = QPlainTextEdit(book_analysis_final_extra_body)
+        self.book_analysis_final_extra_body.setMinimumHeight(66)
+        self.book_analysis_final_extra_body.setToolTip("三级终审请求体额外 JSON 对象。")
+        unified_form.addRow("三级额外请求参数 JSON", self.book_analysis_final_extra_body)
         unified_layout.addLayout(unified_form)
         unified_actions = QHBoxLayout()
         apply_all = QPushButton("一键覆盖全部用途")
@@ -205,7 +233,7 @@ class AiSettingsDialog(QDialog):
             if isinstance(model_field, QLineEdit):
                 model_field.setText(model)
 
-    def values(self) -> dict[str, dict[str, dict[str, str | bool]]]:
+    def values(self) -> dict[str, Any]:
         profiles: dict[str, dict[str, str | bool]] = {}
         for purpose, fields in self.fields.items():
             enabled_box = fields["remote_enabled"]
@@ -218,4 +246,130 @@ class AiSettingsDialog(QDialog):
                 "base_url": base_url_field.text().strip() if isinstance(base_url_field, QLineEdit) else "",
                 "model": model_field.text().strip() if isinstance(model_field, QLineEdit) else "",
             }
-        return {"profiles": profiles}
+        return {
+            "profiles": profiles,
+            "request_retries": self.request_retries.value(),
+            "book_analysis_concurrency": self.book_analysis_concurrency.value(),
+            "book_analysis_fast_extra_body": self.book_analysis_fast_extra_body.toPlainText().strip(),
+            "book_analysis_final_extra_body": self.book_analysis_final_extra_body.toPlainText().strip(),
+        }
+
+
+class PromptSettingsDialog(QDialog):
+    def __init__(
+        self,
+        parent: QWidget,
+        *,
+        entries: list[dict[str, str]],
+        values: dict[str, str],
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Agent 与提示词配置")
+        self.setModal(True)
+        self.resize(980, 680)
+        self.entries = [dict(item) for item in entries if item.get("key")]
+        self.values = {str(item["key"]): str(values.get(str(item["key"]), item.get("default", ""))) for item in self.entries}
+        self.current_key = ""
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 18, 18, 18)
+        root.setSpacing(12)
+        hint = QLabel("可自定义所有内置 Agent 与提示词。默认已填入当前版本提示词；模板中的 {变量名} 会在运行时自动替换。")
+        hint.setWordWrap(True)
+        root.addWidget(hint)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.prompt_list = QListWidget()
+        self.prompt_list.setMinimumWidth(260)
+        for item in self.entries:
+            label = f"{item.get('category', '')} / {item.get('label', item['key'])}"
+            row = QListWidgetItem(label)
+            row.setData(Qt.ItemDataRole.UserRole, str(item["key"]))
+            self.prompt_list.addItem(row)
+        splitter.addWidget(self.prompt_list)
+
+        editor_host = QWidget()
+        editor_layout = QVBoxLayout(editor_host)
+        editor_layout.setContentsMargins(10, 0, 0, 0)
+        self.title_label = QLabel("")
+        self.title_label.setObjectName("SectionTitle")
+        self.placeholder_label = QLabel("")
+        self.placeholder_label.setWordWrap(True)
+        self.editor = QPlainTextEdit()
+        self.editor.setMinimumHeight(420)
+        editor_layout.addWidget(self.title_label)
+        editor_layout.addWidget(self.placeholder_label)
+        editor_layout.addWidget(self.editor, 1)
+
+        actions = QHBoxLayout()
+        reset_current = QPushButton("恢复当前默认")
+        reset_all = QPushButton("全部恢复默认")
+        reset_current.clicked.connect(self._reset_current)
+        reset_all.clicked.connect(self._reset_all)
+        actions.addStretch(1)
+        actions.addWidget(reset_current)
+        actions.addWidget(reset_all)
+        editor_layout.addLayout(actions)
+        splitter.addWidget(editor_host)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        root.addWidget(splitter, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        save_button = buttons.button(QDialogButtonBox.StandardButton.Save)
+        if save_button:
+            save_button.setText("保存")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+        self.prompt_list.currentItemChanged.connect(self._on_current_changed)
+        if self.prompt_list.count():
+            self.prompt_list.setCurrentRow(0)
+
+    def _entry_by_key(self, key: str) -> dict[str, str]:
+        for item in self.entries:
+            if str(item.get("key", "")) == key:
+                return item
+        return {}
+
+    def _save_current_text(self) -> None:
+        if self.current_key:
+            self.values[self.current_key] = self.editor.toPlainText()
+
+    def _on_current_changed(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
+        self._save_current_text()
+        if current is None:
+            self.current_key = ""
+            self.editor.clear()
+            return
+        key = str(current.data(Qt.ItemDataRole.UserRole) or "")
+        self.current_key = key
+        entry = self._entry_by_key(key)
+        self.title_label.setText(str(entry.get("label", key)))
+        placeholders = str(entry.get("placeholders", "")).strip()
+        if placeholders:
+            self.placeholder_label.setText(f"可用变量：{placeholders}")
+        else:
+            self.placeholder_label.setText("此提示词不需要变量。")
+        self.editor.setPlainText(str(self.values.get(key, entry.get("default", ""))))
+
+    def _reset_current(self) -> None:
+        if not self.current_key:
+            return
+        entry = self._entry_by_key(self.current_key)
+        self.editor.setPlainText(str(entry.get("default", "")))
+
+    def _reset_all(self) -> None:
+        for item in self.entries:
+            self.values[str(item["key"])] = str(item.get("default", ""))
+        if self.current_key:
+            self.editor.setPlainText(self.values.get(self.current_key, ""))
+
+    def accept(self) -> None:  # noqa: D102
+        self._save_current_text()
+        super().accept()
+
+    def result_values(self) -> dict[str, str]:
+        self._save_current_text()
+        return dict(self.values)

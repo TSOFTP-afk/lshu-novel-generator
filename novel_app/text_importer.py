@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -43,12 +44,27 @@ _NUMBERED_SECTION_RE = re.compile(
 _SENTENCE_RE = re.compile(r"(?<=[。！？!?；;])\s*")
 
 
-def parse_long_text(book_title: str, raw_text: str) -> ParsedBook:
+def parse_long_text(
+    book_title: str,
+    raw_text: str,
+    chapter_structure: list[dict[str, Any]] | None = None,
+    use_local_headings: bool = True,
+) -> ParsedBook:
     text = _normalize_text(raw_text)
     if not text:
         return ParsedBook(title=book_title.strip() or "未命名导入作品", outline="", chapters=[])
 
-    chapters, explicit_chapter_count = _parse_by_headings(text)
+    chapters: list[ParsedChapter]
+    explicit_chapter_count = 0
+    if chapter_structure:
+        chapters = _parse_by_detected_structure(text, chapter_structure)
+        explicit_chapter_count = len(chapters)
+        if not chapters and not use_local_headings:
+            chapters = [ParsedChapter(title="第1章", content=text.strip(), outline="", volume_title=None)]
+    elif use_local_headings:
+        chapters, explicit_chapter_count = _parse_by_headings(text)
+    else:
+        chapters = [ParsedChapter(title="第1章", content=text.strip(), outline="", volume_title=None)]
     if explicit_chapter_count == 0:
         chapters = _chunk_implicit_chapters(chapters)
 
@@ -67,6 +83,71 @@ def parse_long_text(book_title: str, raw_text: str) -> ParsedBook:
         outline=_extract_book_outline(book_title, normalized_chapters),
         chapters=normalized_chapters,
     )
+
+
+def _parse_by_detected_structure(text: str, chapter_structure: list[dict[str, Any]]) -> list[ParsedChapter]:
+    markers = _normalize_structure_markers(chapter_structure)
+    if not any(marker["kind"] == "chapter" for marker in markers):
+        return []
+
+    markers_by_line: dict[int, list[dict[str, Any]]] = {}
+    for marker in markers:
+        markers_by_line.setdefault(int(marker["line_number"]), []).append(marker)
+
+    chapters: list[ParsedChapter] = []
+    current_volume: str | None = None
+    current_title: str | None = None
+    buffer: list[str] = []
+
+    def flush() -> None:
+        nonlocal buffer, current_title
+        content = "\n".join(buffer).strip()
+        if current_title and content:
+            chapters.append(ParsedChapter(title=current_title, content=content, outline="", volume_title=current_volume))
+        buffer = []
+
+    for line_number, raw_line in enumerate(text.split("\n"), start=1):
+        line_markers = markers_by_line.get(line_number, [])
+        volume_markers = [item for item in line_markers if item["kind"] == "volume"]
+        chapter_markers = [item for item in line_markers if item["kind"] == "chapter"]
+        if volume_markers:
+            flush()
+            current_volume = str(volume_markers[-1]["title"])
+            current_title = None
+            continue
+        if chapter_markers:
+            flush()
+            current_title = str(chapter_markers[-1]["title"])
+            continue
+        if current_title:
+            buffer.append(raw_line)
+    flush()
+    return chapters
+
+
+def _normalize_structure_markers(chapter_structure: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    markers: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+    for item in chapter_structure:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind", "") or "").strip().lower()
+        if kind not in {"volume", "chapter"}:
+            continue
+        try:
+            line_number = int(item.get("line_number", item.get("line", 0)) or 0)
+        except (TypeError, ValueError):
+            continue
+        title = str(item.get("title", "") or "").strip()
+        if line_number <= 0 or not title:
+            continue
+        key = (kind, line_number)
+        if key in seen:
+            continue
+        seen.add(key)
+        markers.append({"kind": kind, "line_number": line_number, "title": title})
+    markers.sort(key=lambda item: (int(item["line_number"]), 0 if item["kind"] == "volume" else 1))
+    return markers
 
 
 def _normalize_text(raw_text: str) -> str:

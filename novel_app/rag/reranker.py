@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 from urllib import request, error
+
+logger = logging.getLogger(__name__)
 
 
 class Reranker:
@@ -40,6 +43,7 @@ class Reranker:
             )
             return [c for c, _ in ranked[:top_n]]
         except Exception:
+            logger.warning("Reranker failed, returning fallback candidates")
             return candidates[:top_n]
 
     def _call_jina_rerank(self, query: str, documents: list[str]) -> list[float]:

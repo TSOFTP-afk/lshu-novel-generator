@@ -20,6 +20,8 @@ from PyQt6.QtWidgets import (
 )
 
 from novel_app.ai_service import SimpleAIService
+from novel_app.prompt_settings import CORRECTION_SYSTEM_PROMPT as DEFAULT_CORRECTION_SYSTEM_PROMPT
+from novel_app.prompt_utils import prompt_value
 
 
 class CorrectionChatWorker(QObject):
@@ -74,6 +76,9 @@ CORRECTION_SYSTEM_PROMPT = """你是 AI 输出纠正助手。你的任务是帮�
 - 增强角色对话辨识度"""
 
 
+CORRECTION_SYSTEM_PROMPT = DEFAULT_CORRECTION_SYSTEM_PROMPT
+
+
 class CorrectionChatDialog(QDialog):
     def __init__(
         self,
@@ -81,12 +86,15 @@ class CorrectionChatDialog(QDialog):
         ai_service: SimpleAIService,
         ai_output: str = "",
         chapter_context: str = "",
+        prompt_overrides: dict[str, str] | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("AI 输出纠正对话")
         self.setModal(False)
         self.resize(800, 700)
         self.ai_service = ai_service
+        self.prompt_overrides = prompt_overrides or {}
+        self.system_prompt = prompt_value(self.prompt_overrides, "correction.system", CORRECTION_SYSTEM_PROMPT)
         self.chat_history: list[dict[str, str]] = []
         self.current_thread: QThread | None = None
         self.current_worker: CorrectionChatWorker | None = None
@@ -160,7 +168,7 @@ class CorrectionChatDialog(QDialog):
         splitter.setStretchFactor(1, 3)
         root.addWidget(splitter, 1)
 
-        self.chat_history.append({"role": "system", "content": CORRECTION_SYSTEM_PROMPT})
+        self.chat_history.append({"role": "system", "content": self.system_prompt})
         if chapter_context.strip():
             self.chat_history.append({"role": "system", "content": f"章节上下文：\n{chapter_context[:3000]}"})
         if ai_output.strip():
@@ -176,7 +184,7 @@ class CorrectionChatDialog(QDialog):
     def set_ai_output(self, ai_output: str) -> None:
         self.orig_viewer.setPlainText(ai_output[:8000])
         self.chat_history[:] = [m for m in self.chat_history if m.get("content", "").startswith("章节上下文")]
-        self.chat_history.insert(0, {"role": "system", "content": CORRECTION_SYSTEM_PROMPT})
+        self.chat_history.insert(0, {"role": "system", "content": self.system_prompt})
         self.chat_history.append({"role": "system", "content": f"需要纠正的 AI 输出：\n{ai_output[:6000]}"})
 
     def send_message(self) -> None:

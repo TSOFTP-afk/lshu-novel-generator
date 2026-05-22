@@ -1,0 +1,165 @@
+# =============================================================================
+# 灵枢 v1.3 — GitHub 上传文件清单
+# 生成时间：2026-05-22
+# 说明：以下为需要提交到 GitHub 的全部文件
+# 排除规则：.gitignore 已排除 __pycache__/ *.pyc *.exe build/ dist/ *.db .env vendor/ release/ etc.
+# =============================================================================
+
+[ 配置文件 ] — 3 个
+  .gitignore
+  pytest.ini
+  requirements.txt
+
+[ 项目文档 ] — 4 个
+  CHANGELOG.md
+  LICENSE                         (CC BY-NC 4.0)
+  README.md
+  release_body.txt
+
+[ 架构设计文档 ] — 1 个
+  docs/长文本小说分析系统架构-实际落地方案.md
+
+[ 构建脚本 ] — 6 个
+  build_debug.ps1
+  build_v1.3_release.bat
+  build_v13.ps1
+  build_v13_release.ps1
+  build_wrapper.ps1
+  packaging/build_first_exe_fast.ps1
+
+[ 打包资源 ] — 3 个
+  packaging/BUILD_RULES.txt
+  packaging/Launcher.cs
+  packaging/app_icon.ico
+
+[ 图片资源 ] — 2 个
+  image_1777455545955.png
+  novel_app/qt/assets/startup_anime.jpg
+
+[ 工具脚本 ] — 1 个
+  tools/health_check.ps1
+
+[ 应用入口 ] — 1 个
+  main.py
+
+[ 根目录测试 ] — 4 个
+  test_core_modules.py
+  test_database_extensions.py
+  test_qt_helpers.py
+  test_text_importer.py
+
+[ 单元测试 ] — 8 个
+  tests/test_agents.py
+  tests/test_audit.py
+  tests/test_rag_modules.py
+  tests/test_star_graph_history.py
+  tests/test_star_graph_models.py
+  tests/test_star_graph_style_manager.py
+  tests/test_text_importer.py
+  tests/test_truth_manager.py
+
+[ 核心代码 — novel_app/ 根级 ] — 11 个
+  novel_app/__init__.py
+  novel_app/ai_service.py
+  novel_app/database.py
+  novel_app/exporter.py
+  novel_app/model_router.py
+  novel_app/prompt_settings.py
+  novel_app/prompt_utils.py
+  novel_app/qt_app.py
+  novel_app/research_sources.py
+  novel_app/secure_storage.py
+  novel_app/structured_templates.py
+  novel_app/text_importer.py
+
+[ 核心代码 — agents/ 多智能体系统 ] — 8 个
+  novel_app/agents/__init__.py
+  novel_app/agents/auditor.py
+  novel_app/agents/chapter_structure.py
+  novel_app/agents/graph.py
+  novel_app/agents/planner.py
+  novel_app/agents/prompts.py
+  novel_app/agents/reviser.py
+  novel_app/agents/writer.py
+
+[ 核心代码 — audit/ 审计模块 ] — 5 个
+  novel_app/audit/__init__.py
+  novel_app/audit/dimensions.py
+  novel_app/audit/dsl_parser.py
+  novel_app/audit/rules.py
+  novel_app/audit/validator.py
+
+[ 核心代码 — core/ 基础设施 ] — 4 个
+  novel_app/core/__init__.py
+  novel_app/core/event_bus.py
+  novel_app/core/service_locator.py
+  novel_app/core/state.py
+
+[ 核心代码 — qt/ UI 层 ] — 28 个
+  novel_app/qt/__init__.py
+  novel_app/qt/character_dialog.py
+  novel_app/qt/chat_dialog.py
+  novel_app/qt/correction_dialog.py
+  novel_app/qt/dialogs.py
+  novel_app/qt/forms.py
+  novel_app/qt/helpers.py
+  novel_app/qt/icons.py
+  novel_app/qt/image_utils.py
+  novel_app/qt/star_graph.py
+  novel_app/qt/star_graph_editors.py
+  novel_app/qt/star_graph_history.py
+  novel_app/qt/star_graph_models.py
+  novel_app/qt/star_graph_style.py
+  novel_app/qt/startup.py
+  novel_app/qt/state.py
+  novel_app/qt/theme.py
+  novel_app/qt/workers.py
+  novel_app/qt/assets/startup_anime.jpg
+  novel_app/qt/drawer/__init__.py
+  novel_app/qt/drawer/characters.py
+  novel_app/qt/drawer/controller.py
+  novel_app/qt/drawer/outline.py
+  novel_app/qt/drawer/overview.py
+  novel_app/qt/drawer/pages.py
+  novel_app/qt/drawer/review.py
+  novel_app/qt/drawer/shortcuts.py
+  novel_app/qt/drawer/skills.py
+  novel_app/qt/drawer/tasks.py
+  novel_app/qt/drawer/world.py
+
+[ 核心代码 — rag/ 向量检索 ] — 5 个
+  novel_app/rag/__init__.py
+  novel_app/rag/embedder.py
+  novel_app/rag/qdrant_client.py
+  novel_app/rag/reranker.py
+  novel_app/rag/retriever.py
+
+[ 核心代码 — state/ 应用状态 ] — 2 个
+  novel_app/state/__init__.py
+  novel_app/state/app_state.py
+
+[ 核心代码 — theme/ 主题系统 ] — 6 个
+  novel_app/theme/__init__.py
+  novel_app/theme/colors.py
+  novel_app/theme/design_tokens.py
+  novel_app/theme/spacing.py
+  novel_app/theme/theme_customization.py
+  novel_app/theme/typography.py
+
+[ 核心代码 — truth/ Truth File 管理 ] — 2 个
+  novel_app/truth/__init__.py
+  novel_app/truth/truth_manager.py
+
+# =============================================================================
+# 统计
+# =============================================================================
+# Python (.py)        : 68
+# Markdown (.md)      : 2  (README, CHANGELOG)
+# PowerShell (.ps1)   : 6
+# 批处理 (.bat)        : 1
+# C# (.cs)            : 1
+# 图片 (.png/.jpg/.ico): 3
+# 文本 (.txt)         : 2  (release_body, BUILD_RULES)
+# 配置文件             : 3  (.gitignore, pytest.ini, requirements.txt)
+# --------------------------------------------------------------
+# 总计                : ~100 个

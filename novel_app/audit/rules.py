@@ -55,6 +55,8 @@ BUILTIN_RULES: list[AuditRule] = [
     AuditRule("R022", "emotion_arc", "角色情感变化有铺垫"),
     AuditRule("R023", "dialogue_quality", "不同角色对话有辨识度"),
     AuditRule("R024", "dialogue_quality", "对话推动情节或展露人物"),
+    AuditRule("R025", "pacing", "叙事节奏合理，快慢段落分布恰当"),
+    AuditRule("R026", "template_alignment", "与对照模板的风格、结构和节奏保持一致"),
 ]
 
 
@@ -95,7 +97,7 @@ class AuditEngine:
         weighted_penalty = 0.0
         for f in findings:
             severity = f.get("severity", "low")
-            dim_id = f.get("dimension_id", f.get("agent", ""))
+            dim_id = f.get("dimension_id") or f.get("dimension") or f.get("agent", "")
             weight = AUDIT_DIMENSION_MAP.get(dim_id, {}).get("weight", 1.0)
             if severity == "high":
                 weighted_penalty += 12.0 * weight

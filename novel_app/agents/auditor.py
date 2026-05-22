@@ -8,34 +8,46 @@ from novel_app.agents.prompts import (
     AUDITOR_GENERATION_TEMPLATE,
     AUDITOR_REVIEW_TEMPLATE,
 )
+from novel_app.prompt_utils import prompt_value, render_prompt
 
 
 class AuditorAgent:
-    def __init__(self, post_chat: Callable[..., dict[str, Any]]) -> None:
+    def __init__(self, post_chat: Callable[..., dict[str, Any]], prompt_overrides: dict[str, str] | None = None) -> None:
         self._post_chat = post_chat
+        self._prompt_overrides = prompt_overrides or {}
 
     def audit(self, state: Any) -> None:
         content = state.draft or state.current_content
+        template_key = "agent.auditor.generation_template" if state.draft else "agent.auditor.review_template"
         template = AUDITOR_GENERATION_TEMPLATE if state.draft else AUDITOR_REVIEW_TEMPLATE
-        prompt = template.format(
-            book_title=state.book_title,
-            chapter_title=state.chapter_title,
-            outline=state.outline,
-            draft=state.draft,
-            content=content[:12000],
-            truth_file=state.truth_file[:6000],
-            sourcebook_context=state.sourcebook_context[:2000],
-            template_content=state.template_content[:2000],
+        prompt = render_prompt(
+            prompt_value(self._prompt_overrides, template_key, template),
+            {
+                "book_title": state.book_title,
+                "chapter_title": state.chapter_title,
+                "outline": state.outline,
+                "draft": state.draft,
+                "content": content[:12000],
+                "truth_file": state.truth_file[:6000],
+                "sourcebook_context": state.sourcebook_context[:2000],
+                "template_content": state.template_content[:2000],
+            },
         )
         result = self._post_chat(
             messages=[
-                {"role": "system", "content": AUDITOR_SYSTEM},
+                {"role": "system", "content": prompt_value(self._prompt_overrides, "agent.auditor.system", AUDITOR_SYSTEM)},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.25,
         )
         raw = result["choices"][0]["message"]["content"].strip()
-        payload = self._extract_json(raw)
+        try:
+            payload = self._extract_json(raw)
+        except Exception as e:
+            state.log(f"Auditor JSON 解析失败: {e}")
+            state.audit_findings = []
+            state.summary = ""
+            return
         findings_raw = payload.get("findings", [])
         if not isinstance(findings_raw, list):
             findings_raw = []

@@ -23,13 +23,10 @@ class APIEmbedder:
             "Authorization": f"Bearer {self._api_key}",
         }
         req = request.Request(endpoint, data=data, headers=headers, method="POST")
-        try:
-            with request.urlopen(req, timeout=60) as response:
-                result = json.loads(response.read().decode("utf-8"))
-                items = sorted(result.get("data", []), key=lambda x: x.get("index", 0))
-                return [item.get("embedding", []) for item in items]
-        except Exception:
-            raise
+        with request.urlopen(req, timeout=60) as response:
+            result = json.loads(response.read().decode("utf-8"))
+            items = sorted(result.get("data", []), key=lambda x: x.get("index", 0))
+            return [item.get("embedding", []) for item in items]
 
     def embed_single(self, text: str) -> list[float]:
         results = self.embed([text])
@@ -66,6 +63,17 @@ class FallbackEmbedder:
         sorted_tokens = sorted(freq.items(), key=lambda x: -x[1])[:self._dim * 3]
         for i, (token, _) in enumerate(sorted_tokens):
             self._vocab[token] = i % self._dim
+
+    def update_vocab(self, texts: list[str]) -> None:
+        if not self._vocab:
+            self._build_vocab(texts)
+            return
+        existing = set(self._vocab.keys())
+        for text in texts:
+            for token in self._tokenize(text):
+                if token not in existing:
+                    existing.add(token)
+                    self._vocab[token] = hash(token) % self._dim
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         if not self._vocab:

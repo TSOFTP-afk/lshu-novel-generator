@@ -4,29 +4,39 @@ import json
 from typing import Any, Callable
 
 from novel_app.agents.prompts import PLANNER_SYSTEM, PLANNER_TEMPLATE
+from novel_app.prompt_utils import prompt_value, render_prompt
 
 
 class PlannerAgent:
-    def __init__(self, post_chat: Callable[..., dict[str, Any]]) -> None:
+    def __init__(self, post_chat: Callable[..., dict[str, Any]], prompt_overrides: dict[str, str] | None = None) -> None:
         self._post_chat = post_chat
+        self._prompt_overrides = prompt_overrides or {}
 
     def plan(self, state: Any) -> None:
-        prompt = PLANNER_TEMPLATE.format(
-            book_title=state.book_title,
-            chapter_title=state.chapter_title,
-            outline=state.outline,
-            truth_file=state.truth_file[:6000],
-            sourcebook_context=state.sourcebook_context[:3000],
+        prompt = render_prompt(
+            prompt_value(self._prompt_overrides, "agent.planner.template", PLANNER_TEMPLATE),
+            {
+                "book_title": state.book_title,
+                "chapter_title": state.chapter_title,
+                "outline": state.outline,
+                "truth_file": state.truth_file[:6000],
+                "sourcebook_context": state.sourcebook_context[:3000],
+            },
         )
         result = self._post_chat(
             messages=[
-                {"role": "system", "content": PLANNER_SYSTEM},
+                {"role": "system", "content": prompt_value(self._prompt_overrides, "agent.planner.system", PLANNER_SYSTEM)},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.3,
         )
         raw = result["choices"][0]["message"]["content"].strip()
-        payload = self._extract_json(raw)
+        try:
+            payload = self._extract_json(raw)
+        except Exception as e:
+            state.log(f"Planner JSON 解析失败: {e}")
+            state.plan = f"围绕「{state.outline[:200]}」按场景推进"
+            return
         scenes = payload.get("scene_plan", [])
         if not isinstance(scenes, list):
             scenes = []

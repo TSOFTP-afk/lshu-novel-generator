@@ -11,6 +11,14 @@ from typing import Any
 from urllib import error, request
 from urllib.parse import urlparse
 
+from novel_app.prompt_utils import prompt_value
+from novel_app.structured_templates import (
+    PROTAGONIST_TEMPLATE,
+    SUPPORTING_CHARACTER_TEMPLATE,
+    WORLD_TEMPLATE,
+    book_outline_template,
+)
+
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 
 
@@ -40,6 +48,7 @@ class SimpleAIService:
     base_url: str | None = None
     model: str | None = None
     last_remote_error: str | None = None
+    prompt_overrides: dict[str, str] | None = None
 
     @classmethod
     def from_env(cls) -> "SimpleAIService":
@@ -69,6 +78,18 @@ class SimpleAIService:
     def set_model_router(self, model_router: Any) -> None:
         self._model_router = model_router
 
+    def set_prompt_overrides(self, prompt_overrides: dict[str, str] | None) -> None:
+        self.prompt_overrides = {
+            str(key): str(value)
+            for key, value in (prompt_overrides or {}).items()
+        }
+
+    def get_prompt_overrides(self) -> dict[str, str]:
+        return dict(self.prompt_overrides or {})
+
+    def prompt_text(self, key: str, default: str = "") -> str:
+        return prompt_value(self.prompt_overrides or {}, key, default)
+
     def is_remote_configured(self) -> bool:
         return bool(self.api_key and self.model)
 
@@ -96,11 +117,7 @@ class SimpleAIService:
         if self.api_key and self.model:
             try:
                 for chunk in self._stream_chat_completion(safe_messages, temperature=0.45, cancel_event=cancel_event):
-                    text = (
-                        chunk.get("choices", [{}])[0]
-                        .get("delta", {})
-                        .get("content", "")
-                    )
+                    text = self._stream_delta_text(chunk)
                     if text:
                         yield text
                 return
@@ -115,6 +132,7 @@ class SimpleAIService:
             api_key=self.api_key,
             base_url=self.base_url,
             model=self.model,
+            prompt_overrides=self.get_prompt_overrides(),
         )
 
     def require_remote(self, purpose: str = "当前功能") -> None:
@@ -386,6 +404,21 @@ class SimpleAIService:
             self._remember_remote_error("文档分类", exc)
             raise
 
+    def detect_chapter_structure(self, text: str, require_remote: bool = False) -> list[dict[str, Any]]:
+        cleaned = text.strip()
+        if not cleaned:
+            return []
+
+        self.require_remote("章节结构识别")
+        try:
+            from novel_app.agents import ChapterStructureAgent
+
+            agent = ChapterStructureAgent(self._post_chat_completion)
+            return agent.detect(cleaned)
+        except Exception as exc:
+            self._remember_remote_error("章节结构识别", exc)
+            raise
+
     def detect_ai_probability(self, text: str) -> tuple[int, str]:
         cleaned = text.strip()
         if not cleaned:
@@ -408,7 +441,7 @@ class SimpleAIService:
             ],
             temperature=0.1,
         )
-        raw_text = result["choices"][0]["message"]["content"].strip()
+        raw_text = self._chat_completion_content(result, "AI 概率检测")
         payload = self._extract_json_object_payload(raw_text)
         probability = self._coerce_probability(payload.get("probability", 0))
         level = str(payload.get("level", "none")).strip().lower()
@@ -420,8 +453,9 @@ class SimpleAIService:
         *,
         require_remote: bool = False,
     ) -> list[dict[str, Any]]:
-        cleaned = (text or "").strip()
-        if not cleaned:
+        content = str(text or "")
+        prompt_content = content.strip()
+        if not prompt_content:
             return []
         if require_remote:
             self.require_remote("AI 纠错检测")
@@ -432,7 +466,7 @@ class SimpleAIService:
             "只输出 JSON 数组，不要解释。每项字段：wrong, suggestion, context, confidence。\n"
             "wrong 必须是原文中连续出现的字或词；suggestion 是建议替换；confidence 为 0-1。\n"
             "如果没有错别字，输出 []。\n\n"
-            f"章节正文：\n{cleaned[:8000]}"
+            f"章节正文：\n{prompt_content[:8000]}"
         )
         result = self._post_chat_completion(
             messages=[
@@ -441,10 +475,12 @@ class SimpleAIService:
             ],
             temperature=0.05,
         )
-        raw_text = result["choices"][0]["message"]["content"].strip()
+        raw_text = self._chat_completion_content(result, "AI 纠错检测")
         try:
             payload = self._extract_json_payload(raw_text)
-        except Exception:
+        except Exception as exc:
+            if require_remote:
+                raise RuntimeError("AI 纠错返回格式无效：未收到 JSON 数组。") from exc
             return []
         findings: list[dict[str, Any]] = []
         occupied_starts: set[int] = set()
@@ -455,9 +491,9 @@ class SimpleAIService:
             suggestion = str(item.get("suggestion", "") or "").strip()
             if not wrong or not suggestion or wrong == suggestion:
                 continue
-            start = cleaned.find(wrong)
+            start = content.find(wrong)
             while start in occupied_starts and start >= 0:
-                start = cleaned.find(wrong, start + len(wrong))
+                start = content.find(wrong, start + len(wrong))
             if start < 0:
                 continue
             occupied_starts.add(start)
@@ -541,6 +577,160 @@ class SimpleAIService:
                 if require_remote:
                     raise
         return self._analyze_book_mock(book_title, book_outline, chapters, characters, world_entries)
+
+    def analyze_book_level1(
+        self,
+        *,
+        book_title: str,
+        book_outline: str,
+        chunk_text: str,
+        chunk_index: int,
+        total_chunks: int,
+        chunk_id: str = "",
+        chapter_ids: list[int] | None = None,
+        extra_body: dict[str, Any] | None = None,
+        require_remote: bool = True,
+    ) -> dict[str, Any]:
+        if require_remote:
+            self.require_remote("全书分析一级")
+        if not self.is_remote_configured():
+            self.require_remote("全书分析一级")
+        try:
+            return self._analyze_book_level1_remote(
+                book_title=book_title,
+                book_outline=book_outline,
+                chunk_text=chunk_text,
+                chunk_index=chunk_index,
+                total_chunks=total_chunks,
+                chunk_id=chunk_id,
+                chapter_ids=chapter_ids or [],
+                extra_body=extra_body,
+            )
+        except Exception as exc:
+            self._remember_remote_error("全书分析一级", exc)
+            raise
+
+    def analyze_book_level2(
+        self,
+        *,
+        book_title: str,
+        level1_results: list[dict[str, Any]],
+        group_index: int,
+        total_groups: int,
+        extra_body: dict[str, Any] | None = None,
+        require_remote: bool = True,
+    ) -> dict[str, Any]:
+        if require_remote:
+            self.require_remote("全书分析二级")
+        if not self.is_remote_configured():
+            self.require_remote("全书分析二级")
+        try:
+            return self._analyze_book_level2_remote(
+                book_title=book_title,
+                level1_results=level1_results,
+                group_index=group_index,
+                total_groups=total_groups,
+                extra_body=extra_body,
+            )
+        except Exception as exc:
+            self._remember_remote_error("全书分析二级", exc)
+            raise
+
+    def analyze_book_level3(
+        self,
+        *,
+        book_title: str,
+        book_outline: str,
+        level2_results: list[dict[str, Any]],
+        chapters: list[dict[str, Any]],
+        characters: list[dict[str, Any]] | None = None,
+        world_entries: list[dict[str, Any]] | None = None,
+        extra_body: dict[str, Any] | None = None,
+        require_remote: bool = True,
+    ) -> dict[str, Any]:
+        if require_remote:
+            self.require_remote("全书分析三级")
+        if not self.is_remote_configured():
+            self.require_remote("全书分析三级")
+        try:
+            return self._analyze_book_level3_draft_remote(
+                book_title=book_title,
+                book_outline=book_outline,
+                level2_results=level2_results,
+                chapters=chapters,
+                characters=characters or [],
+                world_entries=world_entries or [],
+                extra_body=extra_body,
+            )
+        except Exception as exc:
+            self._remember_remote_error("全书分析三级", exc)
+            raise
+
+    def analyze_book_level3_draft(
+        self,
+        *,
+        book_title: str,
+        book_outline: str,
+        level2_results: list[dict[str, Any]],
+        chapters: list[dict[str, Any]],
+        characters: list[dict[str, Any]] | None = None,
+        world_entries: list[dict[str, Any]] | None = None,
+        source_index: list[dict[str, Any]] | None = None,
+        extra_body: dict[str, Any] | None = None,
+        require_remote: bool = True,
+    ) -> dict[str, Any]:
+        if require_remote:
+            self.require_remote("全书分析三级草案")
+        if not self.is_remote_configured():
+            self.require_remote("全书分析三级草案")
+        try:
+            return self._analyze_book_level3_draft_remote(
+                book_title=book_title,
+                book_outline=book_outline,
+                level2_results=level2_results,
+                chapters=chapters,
+                characters=characters or [],
+                world_entries=world_entries or [],
+                source_index=source_index or [],
+                extra_body=extra_body,
+            )
+        except Exception as exc:
+            self._remember_remote_error("全书分析三级草案", exc)
+            raise
+
+    def analyze_book_level3_finalize(
+        self,
+        *,
+        book_title: str,
+        book_outline: str,
+        level2_results: list[dict[str, Any]],
+        draft_payload: dict[str, Any],
+        source_context: dict[str, Any],
+        chapters: list[dict[str, Any]],
+        characters: list[dict[str, Any]] | None = None,
+        world_entries: list[dict[str, Any]] | None = None,
+        extra_body: dict[str, Any] | None = None,
+        require_remote: bool = True,
+    ) -> dict[str, Any]:
+        if require_remote:
+            self.require_remote("全书分析三级原文复核")
+        if not self.is_remote_configured():
+            self.require_remote("全书分析三级原文复核")
+        try:
+            return self._analyze_book_level3_finalize_remote(
+                book_title=book_title,
+                book_outline=book_outline,
+                level2_results=level2_results,
+                draft_payload=draft_payload,
+                source_context=source_context,
+                chapters=chapters,
+                characters=characters or [],
+                world_entries=world_entries or [],
+                extra_body=extra_body,
+            )
+        except Exception as exc:
+            self._remember_remote_error("全书分析三级原文复核", exc)
+            raise
 
     def extract_character_relationships(
         self,
@@ -698,7 +888,11 @@ class SimpleAIService:
             self.require_remote("多 Agent 图编排生成")
         if cancel_event and cancel_event.is_set():
             raise RuntimeError("任务已取消")
-        graph = AgentGraph(self._post_chat_completion, model_router=getattr(self, '_model_router', None))
+        graph = AgentGraph(
+            self._post_chat_completion,
+            model_router=getattr(self, '_model_router', None),
+            prompt_overrides=self.get_prompt_overrides(),
+        )
         state = AgentState(
             book_title=book_title,
             chapter_title=chapter_title,
@@ -735,7 +929,11 @@ class SimpleAIService:
             self.require_remote("多 Agent 图编排审查")
         if cancel_event and cancel_event.is_set():
             raise RuntimeError("任务已取消")
-        graph = AgentGraph(self._post_chat_completion, model_router=getattr(self, '_model_router', None))
+        graph = AgentGraph(
+            self._post_chat_completion,
+            model_router=getattr(self, '_model_router', None),
+            prompt_overrides=self.get_prompt_overrides(),
+        )
         state = AgentState(
             book_title=book_title,
             chapter_title=chapter_title,
@@ -812,7 +1010,7 @@ class SimpleAIService:
             ],
             temperature=0.65,
         )
-        raw_text = result["choices"][0]["message"]["content"].strip()
+        raw_text = self._chat_completion_content(result, "长篇生成")
         return self._extract_json_object_payload(raw_text)
 
     def _multi_agent_generate_mock(
@@ -907,7 +1105,7 @@ class SimpleAIService:
             ],
             temperature=0.25,
         )
-        raw_text = result["choices"][0]["message"]["content"].strip()
+        raw_text = self._chat_completion_content(result, "长篇审查")
         return self._extract_json_object_payload(raw_text)
 
     def _multi_agent_review_mock(
@@ -1131,7 +1329,7 @@ class SimpleAIService:
             ],
             temperature=0.25,
         )
-        raw_text = result["choices"][0]["message"]["content"].strip()
+        raw_text = self._chat_completion_content(result, "跨章节一致性审查")
         return self._extract_json_object_payload(raw_text)
 
     def _cross_chapter_check_mock(
@@ -1225,7 +1423,7 @@ class SimpleAIService:
             ],
             temperature=0.15,
         )
-        raw_text = result["choices"][0]["message"]["content"].strip()
+        raw_text = self._chat_completion_content(result, "风格分析")
         payload = self._extract_json_object_payload(raw_text)
         profile_parts = []
         fields = [
@@ -1299,7 +1497,7 @@ class SimpleAIService:
             ],
             temperature=0.15,
         )
-        raw_text = result["choices"][0]["message"]["content"].strip()
+        raw_text = self._chat_completion_content(result, "角色声音分析")
         payload = self._extract_json_object_payload(raw_text)
         voices = payload.get("character_voices", [])
         if not isinstance(voices, list):
@@ -1343,6 +1541,257 @@ class SimpleAIService:
             parts.append("【角色声音卡片】\n" + "\n".join(voice_lines))
         return "\n\n".join(parts) if parts else ""
 
+    def _analyze_book_level1_remote(
+        self,
+        *,
+        book_title: str,
+        book_outline: str,
+        chunk_text: str,
+        chunk_index: int,
+        total_chunks: int,
+        chunk_id: str = "",
+        chapter_ids: list[int] | None = None,
+        extra_body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        chapter_ids = chapter_ids or []
+        evidence_context = (
+            "\n\n【证据输出要求】\n"
+            f"- 本片段 chunk_id={chunk_id or f'chunk-{chunk_index:04d}'}，覆盖 chapter_ids={json.dumps(chapter_ids, ensure_ascii=False)}。\n"
+            "- 所有事实、人物线索、世界观线索、冲突和疑问都要尽量写入 source_facts。\n"
+            "- source_facts 每项字段：fact_id、chapter_id、chunk_id、category、subject、claim、evidence_quote、confidence、uncertainty。\n"
+            "- evidence_quote 必须是原文短引或极近似短句；没有证据就写入 uncertainty，不要补成事实。\n"
+        )
+        prompt = (
+            "你正在执行三级全书分析的第一级。请直接解读给定原文片段，尽可能保持原文含义，但要精简。\n"
+            "只输出 JSON 对象，不要解释，不要写 Markdown。\n"
+            "JSON 字段：\n"
+            "- level: 固定为 1\n"
+            "- chunk_index: 当前片段序号\n"
+            "- total_chunks: 片段总数\n"
+            "- faithful_digest: 对原文含义的忠实精简解读，保留关键因果、转折和情绪推进\n"
+            "- key_events: 关键事件短句数组\n"
+            "- character_clues: 数组，每项 name, role_hint, motivation, change\n"
+            "- world_clues: 数组，每项 category, content\n"
+            "- chapter_updates: 数组，每项 chapter_id, outline, events\n"
+            "不要发明原文没有的信息；不确定时写入 uncertainty 字段。\n\n"
+            f"书名：{book_title}\n"
+            f"已有书籍级设定：{book_outline[:5000]}\n"
+            f"当前片段：{chunk_index}/{total_chunks}\n"
+            f"片段内容：\n{chunk_text}"
+        )
+        prompt += evidence_context
+        result = self._post_chat_completion(
+            messages=[
+                {"role": "system", "content": "你是中文长篇小说的第一级忠实解读器，只返回指定 JSON。"},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.15,
+            extra_body=extra_body,
+        )
+        raw_text = self._chat_completion_content(result, "全书分析一级")
+        payload = self._extract_json_object_payload(raw_text)
+        payload.setdefault("level", 1)
+        payload.setdefault("chunk_index", chunk_index)
+        payload.setdefault("total_chunks", total_chunks)
+        payload.setdefault("chunk_id", chunk_id or f"chunk-{chunk_index:04d}")
+        payload.setdefault("chapter_ids", chapter_ids)
+        return payload
+
+    def _analyze_book_level2_remote(
+        self,
+        *,
+        book_title: str,
+        level1_results: list[dict[str, Any]],
+        group_index: int,
+        total_groups: int,
+        extra_body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        prompt = (
+            "你正在执行三级全书分析的第二级。请整合若干个第一级解读结果，概括内容、完善逻辑链条，理解故事走向，"
+            "为第三级模板输出做准备。\n"
+            "只输出 JSON 对象，不要解释，不要写 Markdown。\n"
+            "JSON 字段：\n"
+            "- level: 固定为 2\n"
+            "- group_index: 当前二级分组序号\n"
+            "- total_groups: 二级分组总数\n"
+            "- story_summary: 本组故事概括\n"
+            "- logic_chain: 因果链条短句数组\n"
+            "- timeline: 时间线/阶段推进数组\n"
+            "- character_arcs: 数组，每项 name, role, goal, conflict, change, final_state\n"
+            "- world_model: 数组，每项 category, rule, evidence\n"
+            "- chapter_updates: 数组，每项 chapter_id, outline, ai_probability, ai_probability_level, events\n"
+            "- output_hints: 给第三级填写模板时必须保留的要点数组\n"
+            "请控制输出体积：story_summary 800 字以内；logic_chain/timeline 各不超过 12 条；"
+            "consolidated_facts 不超过 24 条；chapter_updates 不超过 40 条；不要复述第一级全文。\n"
+            "JSON 必须严格合法：数组元素、对象字段之间必须有英文逗号；字符串内不要直接换行。\n"
+            "请去重、纠错、合并同名人物和同类设定，但不要创造没有依据的新设定。\n\n"
+            f"书名：{book_title}\n"
+            f"二级分组：{group_index}/{total_groups}\n"
+            f"第一级结果：\n{json.dumps(level1_results, ensure_ascii=False)}"
+        )
+        prompt += (
+            "\n\n【证据保真要求】\n"
+            "- 保留一级 source_facts 中的 fact_id、chapter_id、chunk_id、evidence_quote，不要把证据来源抹掉。\n"
+            "- 输出 consolidated_facts，每项含 fact_ids、chapter_ids、chunk_ids、claim、evidence_quotes、confidence。\n"
+            "- 对冲突信息输出 conflicts；对证据不足但三级需要判断的字段输出 coverage_gaps。\n"
+            "- 不要用类型常识补全剧情、人物动机或世界观规则。\n"
+        )
+        result = self._post_chat_completion(
+            messages=[
+                {"role": "system", "content": "你是中文长篇小说的第二级结构整理器，只返回指定 JSON。"},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.15,
+            extra_body=extra_body,
+        )
+        raw_text = self._chat_completion_content(result, "全书分析二级")
+        payload = self._extract_json_object_payload(raw_text)
+        payload.setdefault("level", 2)
+        payload.setdefault("group_index", group_index)
+        payload.setdefault("total_groups", total_groups)
+        return payload
+
+    def _analyze_book_level3_draft_remote(
+        self,
+        *,
+        book_title: str,
+        book_outline: str,
+        level2_results: list[dict[str, Any]],
+        chapters: list[dict[str, Any]],
+        characters: list[dict[str, Any]],
+        world_entries: list[dict[str, Any]],
+        source_index: list[dict[str, Any]] | None = None,
+        extra_body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        source_index = source_index or []
+        chapter_refs = [
+            {
+                "id": item.get("id"),
+                "title": item.get("title", ""),
+                "outline": item.get("outline", ""),
+            }
+            for item in chapters
+        ]
+        prompt = (
+            "你正在执行三级全书分析的第三级。请整合全部第二级结果，完全理解故事，并直接负责最终输出。\n"
+            "只输出 JSON 对象，不要解释。最终结果将直接覆盖用户现有书籍级、世界观、人物卡和章节分析字段，"
+            "所以请按模板谨慎填写，不要输出空壳。\n"
+            "JSON 字段：\n"
+            "- book_outline: 字符串，可为 Markdown 补充说明\n"
+            "- book_outline_form: 对象，格式为 {fields:{字段ID:{checked/value}}, volume_plans:[{volume_id,volume_title,fields:{core_events/stage_goal/character_appearances/main_conflict/key_turning/ending_hook:{value}}}], supplements:[{title,content}]}\n"
+            "- world_form: 对象，格式为 {fields:{字段ID:{checked/value}}, supplements:[{title,content}]}\n"
+            "- characters: 数组，每项 name, role, profile_form 或 profile_data；必要时可附 profile_text\n"
+            "- chapter_updates: 数组，每项 chapter_id, outline, ai_probability, ai_probability_level, events\n"
+            "ai_probability_level 只能是 certain/high/medium/low/none。events 是本章关键事件短标签数组。\n"
+            "复选框字段必须明确 checked；文本字段必须明确 value。AI 结果会覆盖旧值，所以不要省略已判断出的字段。\n\n"
+            "模板骨架：\n"
+            f"【书籍大纲模板】\n{book_outline_template(book_title)[:2600]}\n\n"
+            f"【世界观设定模板】\n{WORLD_TEMPLATE[:2200]}\n\n"
+            f"【主角设定模板】\n{PROTAGONIST_TEMPLATE[:2200]}\n\n"
+            f"【配角设定模板】\n{SUPPORTING_CHARACTER_TEMPLATE[:1800]}\n\n"
+            f"书名：{book_title}\n"
+            f"当前书籍级设定：{book_outline[:4000]}\n"
+            f"现有人物：{json.dumps(characters[:80], ensure_ascii=False)}\n"
+            f"现有世界观：{json.dumps(world_entries[:40], ensure_ascii=False)}\n"
+            f"章节索引：{json.dumps(chapter_refs, ensure_ascii=False)}\n"
+            f"第二级结果：\n{json.dumps(level2_results, ensure_ascii=False)}"
+        )
+        prompt += (
+            "\n\n【第三级草案与回查要求】\n"
+            "- 你现在先产出可写回草案，同时审查证据是否足够；不要把猜测写成模板字段。\n"
+            "- 所有写入 book_outline_form、world_form、characters.profile_form、chapter_updates 的字段，都尽量附 evidence_refs 或 source_quotes。\n"
+            "- 复选框 checked 只有在二级事实或原文证据明确支持时才为 true；无法判断保持 false 或留空。\n"
+            "- 如遇存疑、冲突、证据不足、字段难以判断，请输出 source_requests 数组。\n"
+            "- source_requests 每项含 request_id、reason、target_field、chapter_id、chunk_id、keywords。\n"
+            "- 无证据但需要人工确认的问题写入 analysis_unresolved，不要写入 Truth/RAG 内容字段。\n"
+            f"\n【本次可回查原文索引】\n{json.dumps(source_index[:120], ensure_ascii=False)}"
+        )
+        result = self._post_chat_completion(
+            messages=[
+                {"role": "system", "content": "你是中文长篇小说项目的第三级终审分析器，只返回最终 JSON。"},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=None,
+            extra_body=extra_body,
+        )
+        raw_text = self._chat_completion_content(result, "全书分析三级草案")
+        payload = self._extract_json_object_payload(raw_text)
+        return payload
+
+    def _analyze_book_level3_remote(
+        self,
+        *,
+        book_title: str,
+        book_outline: str,
+        level2_results: list[dict[str, Any]],
+        chapters: list[dict[str, Any]],
+        characters: list[dict[str, Any]],
+        world_entries: list[dict[str, Any]],
+        extra_body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self._analyze_book_level3_draft_remote(
+            book_title=book_title,
+            book_outline=book_outline,
+            level2_results=level2_results,
+            chapters=chapters,
+            characters=characters,
+            world_entries=world_entries,
+            source_index=[],
+            extra_body=extra_body,
+        )
+
+    def _analyze_book_level3_finalize_remote(
+        self,
+        *,
+        book_title: str,
+        book_outline: str,
+        level2_results: list[dict[str, Any]],
+        draft_payload: dict[str, Any],
+        source_context: dict[str, Any],
+        chapters: list[dict[str, Any]],
+        characters: list[dict[str, Any]],
+        world_entries: list[dict[str, Any]],
+        extra_body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        chapter_refs = [
+            {
+                "id": item.get("id"),
+                "title": item.get("title", ""),
+                "outline": item.get("outline", ""),
+            }
+            for item in chapters
+        ]
+        prompt = (
+            "你是三级全书分析的最终复核器。请根据二级结果、三级草案和本地回查到的原文片段，输出最终可写回 JSON。\n"
+            "只返回 JSON 对象，不要解释，不要 Markdown 包裹。\n"
+            "必须遵守：\n"
+            "- 字段写入只能来自二级事实或 source_context 原文片段；不要用类型常识、网文套路或模板默认值补空。\n"
+            "- 草案中没有证据的字段需要删除或留空；无法解决的问题写入 analysis_unresolved。\n"
+            "- 复选框 checked 只有在原文/二级事实明确支持时才为 true。\n"
+            "- 人物卡重点核实身份、性格、动机、能力、关系线；世界观重点核实规则、时代、势力、地理、危机；书籍级重点核实题材、结构、主题、爽点/虐点、分卷规划。\n"
+            "- 输出字段仍为 book_outline、book_outline_form、world_form、characters、chapter_updates、analysis_unresolved。\n"
+            "- 每个非空 value 或 checked=true 的字段尽量保留 evidence_refs 或 source_quotes。\n\n"
+            f"书名：{book_title}\n"
+            f"当前书籍级设定：{book_outline[:4000]}\n"
+            f"现有人物：{json.dumps(characters[:80], ensure_ascii=False)}\n"
+            f"现有世界观：{json.dumps(world_entries[:40], ensure_ascii=False)}\n"
+            f"章节索引：{json.dumps(chapter_refs, ensure_ascii=False)}\n"
+            f"第二级结果：\n{json.dumps(level2_results, ensure_ascii=False)}\n\n"
+            f"三级草案：\n{json.dumps(draft_payload, ensure_ascii=False)}\n\n"
+            f"回查原文片段：\n{json.dumps(source_context, ensure_ascii=False)}"
+        )
+        result = self._post_chat_completion(
+            messages=[
+                {"role": "system", "content": "你是中文长篇小说项目的第三级原文复核与模板精填器，只返回最终 JSON。"},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=None,
+            extra_body=extra_body,
+        )
+        raw_text = self._chat_completion_content(result, "全书分析三级原文复核")
+        payload = self._extract_json_object_payload(raw_text)
+        return payload
+
     def _analyze_book_remote(
         self,
         *,
@@ -1352,24 +1801,37 @@ class SimpleAIService:
         characters: list[dict[str, Any]],
         world_entries: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        chapter_payload = [
-            {
-                "id": item.get("id"),
-                "title": item.get("title", ""),
-                "outline": item.get("outline", ""),
-                "content": str(item.get("content", ""))[:2200],
-            }
-            for item in chapters[:80]
-        ]
+        MAX_INPUT_CHARS = 80000
+        overhead = len(book_title) + len(book_outline) + len(json.dumps(characters[:40], ensure_ascii=False)) + len(json.dumps(world_entries[:40], ensure_ascii=False)) + 3000
+        available = max(1000, MAX_INPUT_CHARS - overhead)
+        max_chapters = min(len(chapters), 80)
+        per_chapter_limit = max(500, min(2200, available // max(1, max_chapters)))
+        chapter_payload = []
+        for item in chapters[:max_chapters]:
+            chapter_payload.append(
+                {
+                    "id": item.get("id"),
+                    "title": item.get("title", ""),
+                    "outline": item.get("outline", ""),
+                    "content": str(item.get("content", ""))[:per_chapter_limit],
+                }
+            )
         prompt = (
             "请分析这部长篇小说项目，只输出 JSON 对象，不要解释。\n"
             "JSON 字段：\n"
-            "- book_outline: 字符串，用 6-12 行概括全书主线、卷结构和核心冲突\n"
-            "- characters: 数组，每项 name, role, profile_text\n"
-            "- world_entries: 数组，每项 name, category, content_text\n"
+            "- book_outline: 字符串，必须是 Markdown，并按照【书籍大纲模板】补全；用户已填写的字段要作为硬约束保留\n"
+            "- book_outline_form: 可选对象，格式为 {fields:{字段ID:{checked/value}}, volume_plans:[{volume_id,volume_title,fields:{core_events/stage_goal/character_appearances/main_conflict/key_turning/ending_hook:{value}}}], supplements:[{title,content}]}；只填写高置信度字段\n"
+            "- world_form: 可选对象，格式为 {fields:{字段ID:{checked/value}}, supplements:[{title,content}]}；只填写高置信度字段\n"
+            "- characters: 数组，每项 name, role, profile_text；profile_text 必须是 Markdown，主角按【主角设定模板】，其他人物按【配角设定模板】补全\n"
+            "- world_entries: 兼容字段，可为空；优先使用 world_form 表达世界观\n"
             "- chapter_updates: 数组，每项 chapter_id, outline, ai_probability, ai_probability_level, events\n"
             "分级 ai_probability_level 只能是 certain/high/medium/low/none。\n"
             "events 是本章关键事件短标签数组。\n\n"
+            "模板骨架：\n"
+            f"【书籍大纲模板】\n{book_outline_template(book_title)[:2600]}\n\n"
+            f"【世界观设定模板】\n{WORLD_TEMPLATE[:2200]}\n\n"
+            f"【主角设定模板】\n{PROTAGONIST_TEMPLATE[:2200]}\n\n"
+            f"【配角设定模板】\n{SUPPORTING_CHARACTER_TEMPLATE[:1800]}\n\n"
             f"书名：{book_title}\n"
             f"书籍大纲：{book_outline[:4000]}\n"
             f"现有人物：{json.dumps(characters[:40], ensure_ascii=False)}\n"
@@ -1383,7 +1845,7 @@ class SimpleAIService:
             ],
             temperature=0.25,
         )
-        raw_text = result["choices"][0]["message"]["content"].strip()
+        raw_text = self._chat_completion_content(result, "全书分析")
         payload = self._extract_json_object_payload(raw_text)
         return payload
 
@@ -1536,7 +1998,7 @@ class SimpleAIService:
             ],
             temperature=0.18,
         )
-        raw_text = result["choices"][0]["message"]["content"].strip()
+        raw_text = self._chat_completion_content(result, "人物关系分析")
         return self._extract_json_object_payload(raw_text)
 
     def _normalize_relationship_payload(
@@ -1680,7 +2142,7 @@ class SimpleAIService:
             ],
             temperature=0.7,
         )
-        return result["choices"][0]["message"]["content"].strip()
+        return self._chat_completion_content(result, "章节生成")
 
     def _generate_remote_stream(
         self,
@@ -1715,13 +2177,23 @@ class SimpleAIService:
             temperature=0.7,
             cancel_event=cancel_event,
         ):
-            text = (
-                chunk.get("choices", [{}])[0]
-                .get("delta", {})
-                .get("content", "")
-            )
+            text = self._stream_delta_text(chunk)
             if text:
                 yield text
+
+    @staticmethod
+    def _stream_delta_text(chunk: dict[str, Any]) -> str:
+        choices = chunk.get("choices") if isinstance(chunk, dict) else None
+        if not isinstance(choices, list) or not choices:
+            return ""
+        choice = choices[0]
+        if not isinstance(choice, dict):
+            return ""
+        delta = choice.get("delta", {})
+        if not isinstance(delta, dict):
+            return ""
+        content = delta.get("content", "")
+        return content if isinstance(content, str) else ""
 
     def _summarize_remote(
         self,
@@ -1748,7 +2220,7 @@ class SimpleAIService:
             ],
             temperature=0.4,
         )
-        return result["choices"][0]["message"]["content"].strip()
+        return self._chat_completion_content(result, "章节摘要")
 
     def _distill_remote(
         self,
@@ -1772,7 +2244,7 @@ class SimpleAIService:
             ],
             temperature=0.4,
         )
-        raw_text = result["choices"][0]["message"]["content"].strip()
+        raw_text = self._chat_completion_content(result, "参考文本提炼")
         parsed = self._extract_json_payload(raw_text)
 
         skill_records: list[dict[str, str]] = []
@@ -1824,7 +2296,7 @@ class SimpleAIService:
             ],
             temperature=0.35,
         )
-        raw_text = result["choices"][0]["message"]["content"].strip()
+        raw_text = self._chat_completion_content(result, "项目 Skills 提炼")
         parsed = self._extract_json_payload(raw_text)
 
         skill_records: list[dict[str, str]] = []
@@ -1848,13 +2320,17 @@ class SimpleAIService:
     def _post_chat_completion(
         self,
         messages: list[dict[str, str]],
-        temperature: float,
+        temperature: float | None,
+        extra_body: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload = {
             "model": self.model,
             "messages": messages,
-            "temperature": temperature,
         }
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if isinstance(extra_body, dict):
+            payload.update(extra_body)
         endpoint = self._chat_completion_endpoint()
         data = json.dumps(payload).encode("utf-8")
         headers = {
@@ -1868,6 +2344,25 @@ class SimpleAIService:
         except error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="ignore")
             raise RuntimeError(f"HTTP {exc.code}: {body}") from exc
+
+    @staticmethod
+    def _chat_completion_content(result: dict[str, Any], purpose: str = "AI 请求") -> str:
+        choices = result.get("choices") if isinstance(result, dict) else None
+        if not isinstance(choices, list) or not choices:
+            raise RuntimeError(f"{purpose}失败：AI 接口未返回 choices。")
+        first = choices[0]
+        if not isinstance(first, dict):
+            raise RuntimeError(f"{purpose}失败：AI 接口返回格式无效。")
+        message = first.get("message")
+        if not isinstance(message, dict):
+            raise RuntimeError(f"{purpose}失败：AI 接口未返回 message。")
+        content = message.get("content")
+        if content is None:
+            raise RuntimeError(f"{purpose}失败：AI 接口未返回正文内容。")
+        text = str(content).strip()
+        if not text:
+            raise RuntimeError(f"{purpose}失败：AI 接口返回内容为空。")
+        return text
 
     def _stream_chat_completion(
         self,
@@ -1908,17 +2403,8 @@ class SimpleAIService:
             raise RuntimeError(f"HTTP {exc.code}: {body}") from exc
 
     def _extract_json_payload(self, text: str) -> list[Any]:
-        stripped = text.strip()
-        if stripped.startswith("```"):
-            stripped = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", stripped)
-            stripped = re.sub(r"\s*```$", "", stripped)
-
-        start = stripped.find("[")
-        end = stripped.rfind("]")
-        if start != -1 and end != -1 and end > start:
-            stripped = stripped[start : end + 1]
-
-        parsed = json.loads(stripped)
+        stripped = self._json_candidate_text(text, "[", "]")
+        parsed = self._loads_json_payload(stripped)
         if isinstance(parsed, list):
             return parsed
         if isinstance(parsed, dict) and isinstance(parsed.get("skills"), list):
@@ -1926,18 +2412,88 @@ class SimpleAIService:
         raise ValueError("Model did not return a JSON array.")
 
     def _extract_json_object_payload(self, text: str) -> dict[str, Any]:
+        stripped = self._json_candidate_text(text, "{", "}")
+        parsed = self._loads_json_payload(stripped)
+        if isinstance(parsed, dict):
+            return parsed
+        raise ValueError("Model did not return a JSON object.")
+
+    @staticmethod
+    def _json_candidate_text(text: str, open_char: str, close_char: str) -> str:
         stripped = text.strip()
         if stripped.startswith("```"):
             stripped = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", stripped)
             stripped = re.sub(r"\s*```$", "", stripped)
-        start = stripped.find("{")
-        end = stripped.rfind("}")
+        start = stripped.find(open_char)
+        end = stripped.rfind(close_char)
         if start != -1 and end != -1 and end > start:
             stripped = stripped[start : end + 1]
-        parsed = json.loads(stripped)
-        if isinstance(parsed, dict):
-            return parsed
-        raise ValueError("Model did not return a JSON object.")
+        return stripped
+
+    @classmethod
+    def _loads_json_payload(cls, text: str) -> Any:
+        candidates = [text]
+        repaired = cls._repair_json_like_text(text)
+        if repaired != text:
+            candidates.append(repaired)
+        balanced = cls._balance_json_like_text(repaired)
+        if balanced != repaired:
+            candidates.append(balanced)
+        last_error: Exception | None = None
+        for candidate in candidates:
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        return json.loads(text)
+
+    @staticmethod
+    def _repair_json_like_text(text: str) -> str:
+        repaired = text.strip().lstrip("\ufeff")
+        repaired = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", repaired)
+        repaired = (
+            repaired
+            .replace("\u201c", '"')
+            .replace("\u201d", '"')
+            .replace("\u2018", "'")
+            .replace("\u2019", "'")
+        )
+        repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
+        key_pattern = r'"[^"\n\r]+":'
+        repaired = re.sub(rf'([}}\]"])\s*\n\s*({key_pattern})', r"\1,\n\2", repaired)
+        repaired = re.sub(rf'((?:true|false|null)|-?\d+(?:\.\d+)?)\s*\n\s*({key_pattern})', r"\1,\n\2", repaired)
+        repaired = re.sub(r'([}\]"])\s*\n\s*([{\[])', r"\1,\n\2", repaired)
+        repaired = re.sub(r'(")\s*\n\s*(")', r'\1,\n\2', repaired)
+        return repaired
+
+    @staticmethod
+    def _balance_json_like_text(text: str) -> str:
+        stack: list[str] = []
+        in_string = False
+        escaped = False
+        for char in text:
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char in "{[":
+                stack.append("}" if char == "{" else "]")
+            elif char in "}]":
+                if stack and stack[-1] == char:
+                    stack.pop()
+        if in_string:
+            text += '"'
+        if stack:
+            text += "".join(reversed(stack))
+        return text
 
     def _chunk_text(
         self,

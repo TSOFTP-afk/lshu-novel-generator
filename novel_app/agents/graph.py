@@ -10,6 +10,7 @@ from novel_app.agents.planner import PlannerAgent
 from novel_app.agents.writer import WriterAgent
 from novel_app.agents.auditor import AuditorAgent
 from novel_app.agents.reviser import ReviserAgent
+from novel_app.audit.rules import AuditEngine
 
 
 @dataclass
@@ -65,6 +66,7 @@ class AgentGraph:
         self,
         post_chat: Callable[..., dict[str, Any]],
         model_router: Any | None = None,
+        prompt_overrides: dict[str, str] | None = None,
     ) -> None:
         self._post_chat = post_chat
         self._model_router = model_router
@@ -72,6 +74,10 @@ class AgentGraph:
         self.writer = WriterAgent(self._routed_chat("Writer(正文写手)"))
         self.auditor = AuditorAgent(self._routed_chat("Auditor(一致性审计)"))
         self.reviser = ReviserAgent(self._routed_chat("Reviser(修订润色)"))
+
+        self._prompt_overrides = prompt_overrides or {}
+        for agent in (self.planner, self.writer, self.auditor, self.reviser):
+            agent._prompt_overrides = self._prompt_overrides
 
     def _routed_chat(self, agent_name: str) -> Callable[..., dict[str, Any]]:
         if self._model_router is not None:
@@ -90,9 +96,24 @@ class AgentGraph:
         if state.is_cancelled:
             return state
         self._run_node("Reviser(修订润色)", self.reviser.revise, state)
-        if not state.is_cancelled and state.revised_content:
+        if state.is_cancelled:
+            return state
+        if not state.revised_content:
+            state.final_verdict = "reject"
+            state.risk_notes = "流水线未产出有效修订内容"
+            return state
+
+        high_count = sum(1 for f in state.audit_findings if f.get("severity") == "high")
+
+        if high_count >= 2:
+            state.final_verdict = "reject"
+            state.risk_notes = f"存在 {high_count} 个严重问题需要人工处理"
+        elif high_count >= 1:
+            state.final_verdict = "revise"
+        else:
             state.final_verdict = "approve"
-            state.overall_score = self._compute_score(state.audit_findings)
+
+        state.overall_score = self._compute_score(state.audit_findings)
         return state
 
     def run_review(self, state: AgentState) -> AgentState:
@@ -101,9 +122,24 @@ class AgentGraph:
         if state.is_cancelled:
             return state
         self._run_node("Reviser(修订润色)", self.reviser.revise, state)
-        if not state.is_cancelled and state.revised_content:
+        if state.is_cancelled:
+            return state
+        if not state.revised_content:
+            state.final_verdict = "reject"
+            state.risk_notes = "审查流水线未产出有效修订内容"
+            return state
+
+        high_count = sum(1 for f in state.audit_findings if f.get("severity") == "high")
+
+        if high_count >= 2:
+            state.final_verdict = "reject"
+            state.risk_notes = f"存在 {high_count} 个严重问题需要人工处理"
+        elif high_count >= 1:
+            state.final_verdict = "revise"
+        else:
             state.final_verdict = "approve"
-            state.overall_score = self._compute_score(state.audit_findings)
+
+        state.overall_score = self._compute_score(state.audit_findings)
         return state
 
     @staticmethod
@@ -118,12 +154,9 @@ class AgentGraph:
 
     @staticmethod
     def _compute_score(findings: list[dict[str, Any]]) -> int:
-        if not findings:
-            return 85
-        high_count = sum(1 for f in findings if f.get("severity") == "high")
-        medium_count = sum(1 for f in findings if f.get("severity") == "medium")
-        score = 90 - high_count * 15 - medium_count * 5
-        return max(0, min(100, score))
+        engine = AuditEngine()
+        result = engine.score_findings(findings)
+        return result["score"]
 
     @staticmethod
     def _extract_json(text: str) -> dict[str, Any]:

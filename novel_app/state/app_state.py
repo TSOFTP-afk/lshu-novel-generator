@@ -13,7 +13,6 @@ class AppState:
     selected_volume_id: int | None = None
     selected_chapter_id: int | None = None
     selected_character_id: int | None = None
-    selected_world_entry_id: int | None = None
 
     current_tree_iid: str | None = None
     current_node_kind: str = ""

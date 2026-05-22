@@ -55,7 +55,7 @@ class TestAuditRules:
             assert rule.description
 
     def test_builtin_rules_count(self) -> None:
-        assert len(BUILTIN_RULES) == 24
+        assert len(BUILTIN_RULES) == 26
 
     def test_audit_engine_get_rules_for_dimension(self) -> None:
         engine = AuditEngine()

@@ -116,3 +116,23 @@ def format_chapter_tree_display_title(
     if word_count is not None:
         return f"{base} · {max(0, int(word_count))}字"
     return base
+
+
+def previous_chapter_ids_in_order(
+    chapters: list[Any],
+    current_chapter_id: int,
+    limit: int = 3,
+) -> list[int]:
+    previous: list[int] = []
+    for row in chapters:
+        try:
+            chapter_id = int(row["id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if chapter_id == current_chapter_id:
+            break
+        previous.append(chapter_id)
+    limit = max(0, int(limit))
+    if limit <= 0:
+        return []
+    return previous[-limit:]

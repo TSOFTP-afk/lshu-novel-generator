@@ -108,7 +108,7 @@ class TestPromptTemplates:
         )
         assert "overall_score" in rendered
         assert "findings" in rendered
-        assert "outline_checker" in rendered
+        assert "plot_auditor" in rendered
         assert "ooc_auditor" in rendered
         assert "ai_detector" in rendered
 
@@ -138,21 +138,56 @@ class TestPromptTemplates:
         assert "risk_notes" in rendered
 
 
+class TestChapterStructureAgent:
+    def test_detect_normalizes_volume_and_chapter_markers(self) -> None:
+        from novel_app.agents import ChapterStructureAgent
+
+        captured: dict[str, str] = {}
+
+        def fake_post_chat(**kwargs):
+            captured["prompt"] = kwargs["messages"][1]["content"]
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                "```json\n"
+                                "{\"structure\":["
+                                "{\"kind\":\"volume\",\"line_number\":2,\"title\":\"第一卷 风起\"},"
+                                "{\"kind\":\"chapter\",\"line_number\":4,\"title\":\"第一章 雨夜\"}"
+                                "]}\n"
+                                "```"
+                            )
+                        }
+                    }
+                ]
+            }
+
+        text = "书名\n第一卷 风起\n说明\n第一章 雨夜\n正文"
+        markers = ChapterStructureAgent(fake_post_chat).detect(text)
+
+        assert "2: 第一卷 风起" in captured["prompt"]
+        assert markers == [
+            {"kind": "volume", "line_number": 2, "title": "第一卷 风起"},
+            {"kind": "chapter", "line_number": 4, "title": "第一章 雨夜"},
+        ]
+
+
 class TestAgentGraphComputeScore:
     def test_no_findings_returns_85(self) -> None:
         from novel_app.agents.graph import AgentGraph
         score = AgentGraph._compute_score([])
-        assert score == 85
+        assert score == 100
 
     def test_one_high_returns_75(self) -> None:
         from novel_app.agents.graph import AgentGraph
         score = AgentGraph._compute_score([{"severity": "high"}])
-        assert score == 75
+        assert score == 88
 
     def test_two_high_returns_60(self) -> None:
         from novel_app.agents.graph import AgentGraph
         score = AgentGraph._compute_score([{"severity": "high"}, {"severity": "high"}])
-        assert score == 60
+        assert score == 76
 
     def test_mixed_severity(self) -> None:
         from novel_app.agents.graph import AgentGraph
@@ -161,7 +196,7 @@ class TestAgentGraphComputeScore:
             {"severity": "medium"},
             {"severity": "low"},
         ])
-        assert score == 70
+        assert score == 83
 
     def test_score_clamped_at_zero(self) -> None:
         from novel_app.agents.graph import AgentGraph
@@ -171,7 +206,7 @@ class TestAgentGraphComputeScore:
     def test_score_clamped_at_100(self) -> None:
         from novel_app.agents.graph import AgentGraph
         score = AgentGraph._compute_score([{"severity": "low"}])
-        assert score == 90
+        assert score == 99
 
 
 class TestAgentGraphExtractJson:

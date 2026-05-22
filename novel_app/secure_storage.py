@@ -2,19 +2,23 @@ from __future__ import annotations
 
 import base64
 import ctypes
+import logging
 import os
 from ctypes import wintypes
 
+logger = logging.getLogger(__name__)
 
 DPAPI_PREFIX = "dpapi:"
+_APP_ENTROPY = b"LingShuNovel-v1.3"
 
 
 def protect_secret(secret: str) -> str:
     if not secret:
         return ""
     if os.name != "nt":
+        logger.warning("DPAPI is only available on Windows, secret stored as plaintext")
         return secret
-    return f"{DPAPI_PREFIX}{base64.b64encode(_crypt_protect(secret.encode('utf-8'))).decode('ascii')}"
+    return f"{DPAPI_PREFIX}{base64.b64encode(_crypt_protect(secret.encode('utf-8'), _APP_ENTROPY)).decode('ascii')}"
 
 
 def unprotect_secret(value: str) -> str:
@@ -23,9 +27,10 @@ def unprotect_secret(value: str) -> str:
     if not value.startswith(DPAPI_PREFIX):
         return value
     if os.name != "nt":
+        logger.warning("DPAPI is only available on Windows, cannot decrypt secret")
         return ""
     payload = base64.b64decode(value[len(DPAPI_PREFIX) :].encode("ascii"))
-    return _crypt_unprotect(payload).decode("utf-8")
+    return _crypt_unprotect(payload, _APP_ENTROPY).decode("utf-8")
 
 
 class _DataBlob(ctypes.Structure):
@@ -41,7 +46,7 @@ def _make_blob(data: bytes) -> tuple[_DataBlob, ctypes.Array]:
     return blob, buffer
 
 
-def _crypt_protect(data: bytes) -> bytes:
+def _crypt_protect(data: bytes, entropy: bytes | None = None) -> bytes:
     crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     crypt32.CryptProtectData.argtypes = [
@@ -58,11 +63,15 @@ def _crypt_protect(data: bytes) -> bytes:
     kernel32.LocalFree.restype = wintypes.HLOCAL
 
     in_blob, _buffer = _make_blob(data)
+    entropy_blob = None
+    entropy_buffer = None
+    if entropy:
+        entropy_blob, entropy_buffer = _make_blob(entropy)
     out_blob = _DataBlob()
     if not crypt32.CryptProtectData(
         ctypes.byref(in_blob),
         None,
-        None,
+        ctypes.byref(entropy_blob) if entropy_blob else None,
         None,
         None,
         0,
@@ -75,7 +84,7 @@ def _crypt_protect(data: bytes) -> bytes:
         kernel32.LocalFree(ctypes.cast(out_blob.pbData, wintypes.HLOCAL))
 
 
-def _crypt_unprotect(data: bytes) -> bytes:
+def _crypt_unprotect(data: bytes, entropy: bytes | None = None) -> bytes:
     crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     crypt32.CryptUnprotectData.argtypes = [
@@ -92,11 +101,15 @@ def _crypt_unprotect(data: bytes) -> bytes:
     kernel32.LocalFree.restype = wintypes.HLOCAL
 
     in_blob, _buffer = _make_blob(data)
+    entropy_blob = None
+    entropy_buffer = None
+    if entropy:
+        entropy_blob, entropy_buffer = _make_blob(entropy)
     out_blob = _DataBlob()
     if not crypt32.CryptUnprotectData(
         ctypes.byref(in_blob),
         None,
-        None,
+        ctypes.byref(entropy_blob) if entropy_blob else None,
         None,
         None,
         0,

@@ -8,6 +8,8 @@ import sys
 import traceback
 import uuid
 from collections.abc import Callable
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from threading import Event
@@ -15,7 +17,7 @@ from typing import Any
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-from PyQt6.QtCore import QByteArray, QEasingCurve, QPropertyAnimation, QRectF, QSize, QSizeF, QTimer, Qt, QThread, QUrl
+from PyQt6.QtCore import QByteArray, QEasingCurve, QPropertyAnimation, QRectF, QSize, QSizeF, QTimer, Qt, QThread, QUrl, pyqtSignal
 from PyQt6.QtGui import QAction, QBrush, QColor, QCloseEvent, QFont, QIcon, QImage, QKeySequence, QMovie, QPainter, QPixmap, QShortcut, QTextCharFormat, QTextCursor, QStandardItem, QStandardItemModel
 from PyQt6.QtMultimedia import QMediaPlayer
 from PyQt6.QtMultimediaWidgets import QGraphicsVideoItem
@@ -36,6 +38,7 @@ from PyQt6.QtWidgets import (
     QInputDialog,
     QLabel,
     QLineEdit,
+    QLayout,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -63,7 +66,10 @@ from novel_app.exporter import BookExporter
 from novel_app.truth import TruthManager
 from novel_app.rag import ChapterRetriever
 from novel_app.model_router import ModelRouter
-from novel_app.qt.dialogs import AiSettingsDialog, ask_multiline, ask_text, confirm, error, info, ask_unsaved
+from novel_app.qt.dialogs import AiSettingsDialog, PromptSettingsDialog, ask_multiline, ask_text, confirm, error, info, ask_unsaved
+from novel_app.qt.drawer import DRAWER_TAB_SEQUENCE, DrawerController, pages as drawer_pages
+from novel_app.qt.character_dialog import CharacterDetailDialog
+from novel_app.qt.forms import BookOutlineFormWidget, CharacterProfileFormWidget, WorldFormWidget
 from novel_app.qt.helpers import (
     DEFAULT_AI_PROBABILITY_META,
     compute_template_stats,
@@ -73,6 +79,7 @@ from novel_app.qt.helpers import (
     get_ai_probability_meta,
     normalize_ai_color_config,
     normalize_ai_probability_pair,
+    previous_chapter_ids_in_order,
     row_to_dict,
     set_ai_probability_meta,
 )
@@ -80,11 +87,45 @@ from novel_app.qt.chat_dialog import ChatDialog
 from novel_app.qt.icons import make_tree_icon
 from novel_app.qt.image_utils import set_adaptive_image
 from novel_app.qt.state import QtAppState
-from novel_app.qt.star_graph import StarGraphWidget, ask_relationship_type
+from novel_app.qt.star_graph import ask_relationship_type
 from novel_app.qt.theme import PRESET_THEMES, ThemeTokens, build_stylesheet, get_theme
 from novel_app.qt.workers import AiWorker, FunctionWorker
 from novel_app.secure_storage import DPAPI_PREFIX, protect_secret, unprotect_secret
-from novel_app.spell_check import detect_chinese_typos
+from novel_app.prompt_settings import (
+    AGENT_PROMPT_ENTRIES,
+    PROMPT_SETTINGS_VERSION,
+    normalize_prompt_overrides,
+)
+from novel_app.prompt_utils import prompt_value, render_prompt
+from novel_app.structured_templates import (
+    BOOK_OUTLINE_FORM_SCHEMA,
+    BOOK_OUTLINE_VOLUME_PLAN_FIELDS,
+    WORLD_FORM_SCHEMA,
+    book_outline_template,
+    book_outline_form_defaults,
+    book_outline_form_to_markdown,
+    book_outline_markdown_to_form,
+    character_profile_form_defaults,
+    character_profile_form_to_markdown,
+    character_profile_markdown_to_form,
+    character_profile_schema_for_role,
+    coerce_book_outline_markdown,
+    coerce_world_markdown,
+    merge_book_outline_form,
+    merge_book_outline_supplement,
+    merge_character_analysis_payload,
+    merge_character_profile_form,
+    merge_character_profile_supplement,
+    merge_world_analysis_payload,
+    merge_world_supplement,
+    normalize_book_outline_form,
+    normalize_character_profile_form,
+    normalize_world_form,
+    world_form_defaults,
+    world_form_to_markdown,
+    world_markdown_to_form,
+    world_entry_template,
+)
 from novel_app.text_importer import ParsedBook, parse_long_text
 
 try:
@@ -98,6 +139,58 @@ KIND_ROLE = Qt.ItemDataRole.UserRole + 1
 ID_ROLE = Qt.ItemDataRole.UserRole + 2
 GROUP_BOOK_ROLE = Qt.ItemDataRole.UserRole + 3
 AI_LEVEL_ROLE = Qt.ItemDataRole.UserRole + 4
+
+DEEPSEEK_CHAT_SYSTEM_PROMPT = """#### 定位
+- 智能助手名称：灵枢小说创作工作台 AI 对话助手
+- 主要任务：结合当前书籍数据，为作者提供剧情讨论、设定问答、人物推演、正文修改建议和创作决策支持。
+
+#### 能力
+- 上下文整合：优先读取 Truth File、RAG 检索结果、书籍级设定、世界观、人物卡、当前章节大纲和正文。
+- 写作协作：可以做剧情推演、结构建议、文本润色、人物关系分析和问题排查。
+- 冲突识别：当资料互相矛盾时，指出冲突来源，并以 Truth File 与用户当前明确指令为优先。
+
+#### 使用说明
+- 回答要直接、自然、便于作者继续操作。
+- 需要改写时，给出可复制的片段或清晰修改方案；不要擅自覆盖用户正文。
+- 不确定的信息要标注为推断，不要把猜测写成既定事实。
+- 用户要求角色代入时，遵守所选人物卡、关系状态和剧情进度。"""
+
+DEEPSEEK_CHARACTER_CHAT_PROMPT_TEMPLATE = """#### 定位
+- 当前模式：角色对话
+- 你正在代入书中人物：{name}
+- 人物定位：{role}
+
+#### 人物资料
+{profile}
+{self_line}
+
+#### 使用说明
+- 使用该角色的第一人称口吻回答作者。
+- 只知道人物在当前剧情和设定中合理知道的内容。
+- 结合上方 Truth File、RAG、章节上下文和人物关系说话。
+- 不要跳出角色解释自己是 AI；除非作者明确要求写作建议。
+- 资料不足时，可以用角色视角表达迟疑，不要硬编书中没有的事实。"""
+
+BUILTIN_CHAT_SYSTEM_PROMPT = DEEPSEEK_CHAT_SYSTEM_PROMPT
+CHARACTER_CHAT_PROMPT_TEMPLATE = DEEPSEEK_CHARACTER_CHAT_PROMPT_TEMPLATE
+
+PROMPT_SETTING_ENTRIES = [
+    {
+        "key": "chat.system",
+        "category": "AI 对话",
+        "label": "AI 对话内置系统提示词",
+        "default": BUILTIN_CHAT_SYSTEM_PROMPT,
+        "placeholders": "",
+    },
+    {
+        "key": "chat.character_template",
+        "category": "AI 对话",
+        "label": "角色对话提示词模板",
+        "default": CHARACTER_CHAT_PROMPT_TEMPLATE,
+        "placeholders": "name, role, profile, self_name, self_line",
+    },
+    *AGENT_PROMPT_ENTRIES,
+]
 
 THEME_PRESET_LABELS = [
     ("white", "白色亮色"),
@@ -137,6 +230,7 @@ AI_PURPOSES = [
     ("writing", "写作生成"),
     ("outline", "同步大纲"),
     ("detector", "AI概率检测"),
+    ("correction", "AI纠错"),
     ("import", "智能导入分类"),
     ("skills", "Skills提炼"),
     ("book_analysis", "全书分析"),
@@ -144,7 +238,17 @@ AI_PURPOSES = [
     ("chat", "AI 对话"),
 ]
 
-DRAWER_TAB_SEQUENCE = ("overview", "outline", "characters", "star", "world", "skills", "review", "tasks")
+APP_DISPLAY_NAME = "灵枢v1.3"
+DEFAULT_AI_REQUEST_RETRIES = 2
+DEFAULT_BOOK_ANALYSIS_CONCURRENCY = 3
+DEFAULT_BOOK_ANALYSIS_FAST_EXTRA_BODY_JSON = '{"thinking":{"type":"disabled"}}'
+DEFAULT_BOOK_ANALYSIS_FINAL_EXTRA_BODY_JSON = '{"thinking":{"type":"enabled"},"reasoning_effort":"high"}'
+BOOK_ANALYSIS_SOURCE_REQUEST_LIMIT = 12
+BOOK_ANALYSIS_SOURCE_SNIPPETS_PER_REQUEST = 3
+BOOK_ANALYSIS_SOURCE_SNIPPET_CHARS = 1200
+BOOK_ANALYSIS_SOURCE_CONTEXT_CHARS = 18000
+BOOK_ANALYSIS_MIN_FIELD_CONFIDENCE = 0.65
+AI_SETTINGS_VERSION = "ai_profiles_v5_deepseek_prompts"
 
 AI_MODE_PURPOSE = {
     "draft": "writing",
@@ -445,6 +549,181 @@ class SoftSplitter(QSplitter):
         return SoftSplitterHandle(self.orientation(), self)
 
 
+def _find_plain_text_matches(
+    text: str,
+    query: str,
+    *,
+    case_sensitive: bool = False,
+    whole_word: bool = False,
+) -> list[tuple[int, int]]:
+    if not query:
+        return []
+    flags = 0 if case_sensitive else re.IGNORECASE
+    if whole_word:
+        pattern = re.compile(rf"(?<![\w\u4e00-\u9fff]){re.escape(query)}(?![\w\u4e00-\u9fff])", flags)
+        return [(match.start(), match.end()) for match in pattern.finditer(text)]
+
+    haystack = text if case_sensitive else text.casefold()
+    needle = query if case_sensitive else query.casefold()
+    matches: list[tuple[int, int]] = []
+    index = 0
+    while True:
+        index = haystack.find(needle, index)
+        if index < 0:
+            break
+        end = index + len(query)
+        matches.append((index, end))
+        index += max(1, len(query))
+    return matches
+
+
+def _search_snippet(text: str, start: int, end: int, radius: int = 28) -> str:
+    left = max(0, start - radius)
+    right = min(len(text), end + radius)
+    prefix = "…" if left > 0 else ""
+    suffix = "…" if right < len(text) else ""
+    snippet = text[left:right].replace("\n", " ").strip()
+    return f"{prefix}{snippet}{suffix}"
+
+
+class SearchDialog(QDialog):
+    def __init__(self, parent: Any) -> None:
+        super().__init__(parent)
+        self._main_window = parent
+        self.setWindowTitle("查找")
+        self.setModal(False)
+        self.resize(560, 440)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        query_row = QHBoxLayout()
+        query_row.addWidget(QLabel("查找内容"))
+        self.query_field = QLineEdit()
+        self.query_field.setClearButtonEnabled(True)
+        self.query_field.returnPressed.connect(self._find_next)
+        query_row.addWidget(self.query_field, 1)
+        layout.addLayout(query_row)
+
+        scope_row = QHBoxLayout()
+        scope_row.addWidget(QLabel("搜索范围"))
+        self.scope_combo = QComboBox()
+        self.scope_combo.currentIndexChanged.connect(lambda _index: self._run_search())
+        scope_row.addWidget(self.scope_combo, 1)
+        layout.addLayout(scope_row)
+
+        options_row = QHBoxLayout()
+        self.case_box = QCheckBox("区分大小写")
+        self.whole_word_box = QCheckBox("全词匹配")
+        self.case_box.toggled.connect(lambda _checked: self._run_search())
+        self.whole_word_box.toggled.connect(lambda _checked: self._run_search())
+        options_row.addWidget(self.case_box)
+        options_row.addWidget(self.whole_word_box)
+        options_row.addStretch(1)
+        layout.addLayout(options_row)
+
+        action_row = QHBoxLayout()
+        self.prev_button = QPushButton("查找上一个")
+        self.next_button = QPushButton("查找下一个")
+        close_button = QPushButton("关闭")
+        self.prev_button.clicked.connect(self._find_previous)
+        self.next_button.clicked.connect(self._find_next)
+        close_button.clicked.connect(self.close)
+        action_row.addStretch(1)
+        action_row.addWidget(self.prev_button)
+        action_row.addWidget(self.next_button)
+        action_row.addWidget(close_button)
+        layout.addLayout(action_row)
+
+        self.result_list = QListWidget()
+        self.result_list.itemActivated.connect(self._activate_result)
+        self.result_list.currentItemChanged.connect(lambda current, _previous: self._activate_current_result(current))
+        layout.addWidget(self.result_list, 1)
+
+        self.status_label = QLabel("输入关键词后按 Enter 或“查找下一个”。")
+        self.status_label.setObjectName("MetaLabel")
+        layout.addWidget(self.status_label)
+
+    def set_scope_options(self, options: list[tuple[str, str]], current_scope: str) -> None:
+        current = str(self.scope_combo.currentData() or current_scope)
+        self.scope_combo.blockSignals(True)
+        self.scope_combo.clear()
+        for scope, label in options:
+            self.scope_combo.addItem(label, scope)
+        target = current if any(scope == current for scope, _label in options) else current_scope
+        index = self.scope_combo.findData(target)
+        self.scope_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.scope_combo.blockSignals(False)
+
+    def focus_query(self) -> None:
+        self.query_field.setFocus()
+        self.query_field.selectAll()
+
+    def set_results(self, results: list[dict[str, Any]], current_index: int) -> None:
+        self.result_list.blockSignals(True)
+        self.result_list.clear()
+        for index, result in enumerate(results):
+            label = f"{index + 1}. {result.get('title', '')} · {result.get('field_label', '')}：{result.get('snippet', '')}"
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, index)
+            self.result_list.addItem(item)
+        if results and 0 <= current_index < len(results):
+            self.result_list.setCurrentRow(current_index)
+        self.result_list.blockSignals(False)
+        self._sync_status(len(results), current_index)
+
+    def _scope(self) -> str:
+        return str(self.scope_combo.currentData() or "")
+
+    def _run_search(self) -> None:
+        query = self.query_field.text()
+        if not query.strip():
+            self._main_window._clear_search_results()
+            return
+        self._main_window._run_search_from_dialog(
+            query=query,
+            scope=self._scope(),
+            case_sensitive=self.case_box.isChecked(),
+            whole_word=self.whole_word_box.isChecked(),
+        )
+
+    def _find_next(self) -> None:
+        if not self._main_window._search_matches or self._params_changed():
+            self._run_search()
+            return
+        self._main_window._search_next_match()
+
+    def _find_previous(self) -> None:
+        if not self._main_window._search_matches or self._params_changed():
+            self._run_search()
+            return
+        self._main_window._search_previous_match()
+
+    def _params_changed(self) -> bool:
+        return (
+            self.query_field.text().strip() != self._main_window._search_query
+            or self._scope() != self._main_window._search_scope
+            or self.case_box.isChecked() != self._main_window._search_case_sensitive
+            or self.whole_word_box.isChecked() != self._main_window._search_whole_word
+        )
+
+    def _activate_result(self, item: QListWidgetItem) -> None:
+        self._activate_current_result(item)
+
+    def _activate_current_result(self, item: QListWidgetItem | None) -> None:
+        if item is None:
+            return
+        index = int(item.data(Qt.ItemDataRole.UserRole) or 0)
+        self._main_window._activate_search_result(index)
+
+    def _sync_status(self, count: int, current_index: int) -> None:
+        if count <= 0:
+            self.status_label.setText("未找到匹配项。")
+            return
+        self.status_label.setText(f"找到 {count} 处匹配，当前第 {current_index + 1} 处。")
+
+
 class NovelQtMainWindow(QMainWindow):
     def __init__(self, database: Database, ai_service: SimpleAIService) -> None:
         super().__init__()
@@ -477,7 +756,6 @@ class NovelQtMainWindow(QMainWindow):
         self.library_width = 260
         self.library_auto_collapse_width = 132
         self.qt_drawer_width = 420
-        self.correction_ai_enabled = False
         self.auto_save_enabled = False
         self.auto_save_interval_seconds = 30
         self.focus_mode = False
@@ -493,10 +771,19 @@ class NovelQtMainWindow(QMainWindow):
         self.characters: list[dict[str, Any]] = []
         self.world_entries: list[dict[str, Any]] = []
         self.selected_character_id: int | None = None
-        self.selected_world_entry_id: int | None = None
+        self._world_form_book_id: int | None = None
         self.selected_review_run_id: int | None = None
         self.chat_dialog: ChatDialog | None = None
+        self.character_detail_dialog: CharacterDetailDialog | None = None
+        self.search_dialog: SearchDialog | None = None
+        self._search_matches: list[dict[str, Any]] = []
+        self._search_match_index = -1
+        self._search_query = ""
+        self._search_scope = ""
+        self._search_case_sensitive = False
+        self._search_whole_word = False
         self.drawer_tab_indexes: dict[str, int] = {}
+        self.drawer_controller = DrawerController(self)
         self.current_book_cover_path = ""
         self.character_image_path = ""
         self.ai_thread: QThread | None = None
@@ -589,7 +876,6 @@ class NovelQtMainWindow(QMainWindow):
         self.library_collapsed = bool(payload.get("library_collapsed", False))
         self.library_width = self._safe_int(payload.get("library_width", 260), 260, 180, 520)
         self.qt_drawer_width = self._safe_int(payload.get("qt_drawer_width", 420), 420, 320, 620)
-        self.correction_ai_enabled = bool(payload.get("correction_ai_enabled", False))
         self.auto_save_enabled = bool(payload.get("auto_save_enabled", False))
         self.auto_save_interval_seconds = self._safe_int(payload.get("auto_save_interval_seconds", 30), 30, 5, 3600)
 
@@ -607,7 +893,6 @@ class NovelQtMainWindow(QMainWindow):
                 "library_collapsed": bool(self.library_collapsed),
                 "library_width": int(self.library_width),
                 "qt_drawer_width": int(self.qt_drawer_width),
-                "correction_ai_enabled": bool(self.correction_ai_enabled),
                 "auto_save_enabled": bool(self.auto_save_enabled),
                 "auto_save_interval_seconds": int(self.auto_save_interval_seconds),
             }
@@ -633,6 +918,38 @@ class NovelQtMainWindow(QMainWindow):
             result = default
         return max(minimum, min(maximum, result))
 
+    @staticmethod
+    def _compact_json_object_text(payload: dict[str, Any]) -> str:
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+    def _normalize_json_object_text(self, value: Any, default_text: str) -> str:
+        try:
+            default_payload = json.loads(default_text)
+        except json.JSONDecodeError:
+            default_payload = {}
+        if isinstance(value, dict):
+            return self._compact_json_object_text(value)
+        text = str(value or "").strip() or default_text
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return self._compact_json_object_text(default_payload if isinstance(default_payload, dict) else {})
+        if not isinstance(parsed, dict):
+            return self._compact_json_object_text(default_payload if isinstance(default_payload, dict) else {})
+        return self._compact_json_object_text(parsed)
+
+    def _parse_json_object_text(self, value: Any, label: str) -> dict[str, Any]:
+        text = str(value or "").strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{label}必须是 JSON 对象：{exc}") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(f"{label}必须是 JSON 对象。")
+        return parsed
+
     def _load_ai_settings(self) -> None:
         config: dict[str, Any] = {}
         if self.ai_config_path.exists():
@@ -646,6 +963,15 @@ class NovelQtMainWindow(QMainWindow):
             for purpose, _label in AI_PURPOSES:
                 raw_profile = profiles_raw.get(purpose, {})
                 profiles[purpose] = self._load_ai_profile(raw_profile if isinstance(raw_profile, dict) else {})
+            if config.get("version") != AI_SETTINGS_VERSION:
+                writing_profile = profiles.get("writing", {})
+                if self._ai_profile_has_credentials(writing_profile):
+                    for purpose, _label in AI_PURPOSES:
+                        if purpose == "writing":
+                            continue
+                        profile = profiles.get(purpose, {})
+                        if not self._ai_profile_has_credentials(profile):
+                            profiles[purpose] = dict(writing_profile)
         else:
             legacy_profile = self._load_ai_profile(
                 {
@@ -656,23 +982,77 @@ class NovelQtMainWindow(QMainWindow):
                 }
             )
             for purpose, _label in AI_PURPOSES:
-                profiles[purpose] = {
-                    "remote_enabled": False,
-                    "api_key": "",
-                    "base_url": DEFAULT_BASE_URL,
-                    "model": "",
-                }
-            profiles["writing"] = legacy_profile
-        self.ai_settings = {"profiles": profiles}
+                profiles[purpose] = (
+                    dict(legacy_profile)
+                    if self._ai_profile_has_credentials(legacy_profile)
+                    else {
+                        "remote_enabled": False,
+                        "api_key": "",
+                        "base_url": DEFAULT_BASE_URL,
+                        "model": "",
+                    }
+                )
+        request_retries = self._safe_int(
+            config.get("request_retries", DEFAULT_AI_REQUEST_RETRIES),
+            DEFAULT_AI_REQUEST_RETRIES,
+            0,
+            5,
+        )
+        book_analysis_concurrency = self._safe_int(
+            config.get("book_analysis_concurrency", DEFAULT_BOOK_ANALYSIS_CONCURRENCY),
+            DEFAULT_BOOK_ANALYSIS_CONCURRENCY,
+            1,
+            8,
+        )
+        book_analysis_fast_extra_body = self._normalize_json_object_text(
+            config.get("book_analysis_fast_extra_body", DEFAULT_BOOK_ANALYSIS_FAST_EXTRA_BODY_JSON),
+            DEFAULT_BOOK_ANALYSIS_FAST_EXTRA_BODY_JSON,
+        )
+        book_analysis_final_extra_body = self._normalize_json_object_text(
+            config.get("book_analysis_final_extra_body", DEFAULT_BOOK_ANALYSIS_FINAL_EXTRA_BODY_JSON),
+            DEFAULT_BOOK_ANALYSIS_FINAL_EXTRA_BODY_JSON,
+        )
+        stored_prompt_version = str(config.get("prompt_settings_version", ""))
+        prompt_source = (
+            config.get("prompt_overrides", {})
+            if stored_prompt_version == PROMPT_SETTINGS_VERSION
+            else {}
+        )
+        prompt_overrides = normalize_prompt_overrides(prompt_source, PROMPT_SETTING_ENTRIES)
+        self.ai_request_retries = request_retries
+        self.book_analysis_concurrency = book_analysis_concurrency
+        self.book_analysis_fast_extra_body = book_analysis_fast_extra_body
+        self.book_analysis_final_extra_body = book_analysis_final_extra_body
+        self.prompt_overrides = prompt_overrides
+        self.ai_settings = {
+            "profiles": profiles,
+            "request_retries": request_retries,
+            "book_analysis_concurrency": book_analysis_concurrency,
+            "book_analysis_fast_extra_body": book_analysis_fast_extra_body,
+            "book_analysis_final_extra_body": book_analysis_final_extra_body,
+            "prompt_settings_version": PROMPT_SETTINGS_VERSION,
+            "prompt_overrides": prompt_overrides,
+        }
         writing_service = self._service_from_profile(profiles.get("writing", {}))
         self.ai_service.configure(
             api_key=writing_service.api_key,
             base_url=writing_service.base_url,
             model=writing_service.model,
         )
+        self.ai_service.set_prompt_overrides(prompt_overrides)
         if config and (not isinstance(profiles_raw, dict) or self._ai_config_needs_migration(config)):
             try:
-                self._write_json_file(self.ai_config_path, self._build_stored_ai_settings(profiles))
+                self._write_json_file(
+                    self.ai_config_path,
+                    self._build_stored_ai_settings(
+                        profiles,
+                        request_retries,
+                        book_analysis_concurrency,
+                        book_analysis_fast_extra_body,
+                        book_analysis_final_extra_body,
+                        prompt_overrides,
+                    ),
+                )
             except (OSError, ValueError):
                 return
 
@@ -707,9 +1087,24 @@ class NovelQtMainWindow(QMainWindow):
         }
 
     def _ai_config_needs_migration(self, config: dict[str, Any]) -> bool:
+        if config.get("version") != AI_SETTINGS_VERSION:
+            return True
+        if config.get("prompt_settings_version") != PROMPT_SETTINGS_VERSION:
+            return True
         profiles = config.get("profiles")
         if not isinstance(profiles, dict):
             return True
+        if "request_retries" not in config:
+            return True
+        for key in ("book_analysis_concurrency", "book_analysis_fast_extra_body", "book_analysis_final_extra_body", "prompt_overrides"):
+            if key not in config:
+                return True
+        prompt_overrides = config.get("prompt_overrides")
+        if not isinstance(prompt_overrides, dict):
+            return True
+        for item in PROMPT_SETTING_ENTRIES:
+            if str(item.get("key", "")) not in prompt_overrides:
+                return True
         for purpose, _label in AI_PURPOSES:
             if purpose not in profiles:
                 return True
@@ -720,7 +1115,15 @@ class NovelQtMainWindow(QMainWindow):
                 return True
         return False
 
-    def _build_stored_ai_settings(self, profiles: dict[str, dict[str, str | bool]]) -> dict[str, Any]:
+    def _build_stored_ai_settings(
+        self,
+        profiles: dict[str, dict[str, str | bool]],
+        request_retries: int | None = None,
+        book_analysis_concurrency: int | None = None,
+        book_analysis_fast_extra_body: str | dict[str, Any] | None = None,
+        book_analysis_final_extra_body: str | dict[str, Any] | None = None,
+        prompt_overrides: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         stored_profiles: dict[str, dict[str, str | bool]] = {}
         for purpose, _label in AI_PURPOSES:
             profile = profiles.get(purpose, {})
@@ -731,7 +1134,54 @@ class NovelQtMainWindow(QMainWindow):
                 "base_url": str(profile.get("base_url", DEFAULT_BASE_URL) or DEFAULT_BASE_URL),
                 "model": str(profile.get("model", "")),
             }
-        return {"profiles": stored_profiles}
+        retries = self._safe_int(
+            request_retries if request_retries is not None else getattr(self, "ai_request_retries", DEFAULT_AI_REQUEST_RETRIES),
+            DEFAULT_AI_REQUEST_RETRIES,
+            0,
+            5,
+        )
+        concurrency = self._safe_int(
+            book_analysis_concurrency
+            if book_analysis_concurrency is not None
+            else getattr(self, "book_analysis_concurrency", DEFAULT_BOOK_ANALYSIS_CONCURRENCY),
+            DEFAULT_BOOK_ANALYSIS_CONCURRENCY,
+            1,
+            8,
+        )
+        fast_extra = self._normalize_json_object_text(
+            book_analysis_fast_extra_body
+            if book_analysis_fast_extra_body is not None
+            else getattr(self, "book_analysis_fast_extra_body", DEFAULT_BOOK_ANALYSIS_FAST_EXTRA_BODY_JSON),
+            DEFAULT_BOOK_ANALYSIS_FAST_EXTRA_BODY_JSON,
+        )
+        final_extra = self._normalize_json_object_text(
+            book_analysis_final_extra_body
+            if book_analysis_final_extra_body is not None
+            else getattr(self, "book_analysis_final_extra_body", DEFAULT_BOOK_ANALYSIS_FINAL_EXTRA_BODY_JSON),
+            DEFAULT_BOOK_ANALYSIS_FINAL_EXTRA_BODY_JSON,
+        )
+        prompts = normalize_prompt_overrides(
+            prompt_overrides if prompt_overrides is not None else getattr(self, "prompt_overrides", {}),
+            PROMPT_SETTING_ENTRIES,
+        )
+        return {
+            "version": AI_SETTINGS_VERSION,
+            "prompt_settings_version": PROMPT_SETTINGS_VERSION,
+            "profiles": stored_profiles,
+            "request_retries": retries,
+            "book_analysis_concurrency": concurrency,
+            "book_analysis_fast_extra_body": fast_extra,
+            "book_analysis_final_extra_body": final_extra,
+            "prompt_overrides": prompts,
+        }
+
+    def _ai_profile_has_credentials(self, profile: dict[str, Any] | dict[str, str | bool]) -> bool:
+        return bool(
+            isinstance(profile, dict)
+            and profile.get("remote_enabled", False)
+            and str(profile.get("api_key", "")).strip()
+            and str(profile.get("model", "")).strip()
+        )
 
     def _service_from_profile(self, profile: dict[str, str | bool]) -> SimpleAIService:
         service = SimpleAIService()
@@ -747,6 +1197,7 @@ class NovelQtMainWindow(QMainWindow):
                 base_url=str(profile.get("base_url", DEFAULT_BASE_URL) or DEFAULT_BASE_URL),
                 model=None,
             )
+        service.set_prompt_overrides(getattr(self, "prompt_overrides", {}))
         return service
 
     def _ai_profiles(self) -> dict[str, dict[str, str | bool]]:
@@ -774,8 +1225,30 @@ class NovelQtMainWindow(QMainWindow):
         profiles_raw = values.get("profiles", {})
         if not isinstance(profiles_raw, dict):
             profiles_raw = {}
+        request_retries = self._safe_int(
+            values.get("request_retries", DEFAULT_AI_REQUEST_RETRIES),
+            DEFAULT_AI_REQUEST_RETRIES,
+            0,
+            5,
+        )
+        book_analysis_concurrency = self._safe_int(
+            values.get("book_analysis_concurrency", DEFAULT_BOOK_ANALYSIS_CONCURRENCY),
+            DEFAULT_BOOK_ANALYSIS_CONCURRENCY,
+            1,
+            8,
+        )
         profiles: dict[str, dict[str, str | bool]] = {}
         try:
+            book_analysis_fast_extra = self._parse_json_object_text(
+                values.get("book_analysis_fast_extra_body", DEFAULT_BOOK_ANALYSIS_FAST_EXTRA_BODY_JSON),
+                "一级/二级额外请求参数 JSON",
+            )
+            book_analysis_final_extra = self._parse_json_object_text(
+                values.get("book_analysis_final_extra_body", DEFAULT_BOOK_ANALYSIS_FINAL_EXTRA_BODY_JSON),
+                "三级额外请求参数 JSON",
+            )
+            book_analysis_fast_extra_text = self._compact_json_object_text(book_analysis_fast_extra)
+            book_analysis_final_extra_text = self._compact_json_object_text(book_analysis_final_extra)
             for purpose, _label in AI_PURPOSES:
                 profile = profiles_raw.get(purpose, {})
                 profile = profile if isinstance(profile, dict) else {}
@@ -790,21 +1263,44 @@ class NovelQtMainWindow(QMainWindow):
                 if bool(profile.get("remote_enabled", False)) and (not loaded["api_key"] or not loaded["model"]):
                     raise ValueError(f"{dict(AI_PURPOSES).get(purpose, purpose)}已启用，但 API Key 或模型为空。")
                 profiles[purpose] = loaded
-            self._write_json_file(self.ai_config_path, self._build_stored_ai_settings(profiles))
+            self._write_json_file(
+                self.ai_config_path,
+                self._build_stored_ai_settings(
+                    profiles,
+                    request_retries,
+                    book_analysis_concurrency,
+                    book_analysis_fast_extra_text,
+                    book_analysis_final_extra_text,
+                    getattr(self, "prompt_overrides", {}),
+                ),
+            )
         except (OSError, ValueError) as exc:
             error(self, "AI 设置无效", str(exc))
             return
-        self.ai_settings = {"profiles": profiles}
+        self.ai_request_retries = request_retries
+        self.book_analysis_concurrency = book_analysis_concurrency
+        self.book_analysis_fast_extra_body = book_analysis_fast_extra_text
+        self.book_analysis_final_extra_body = book_analysis_final_extra_text
+        self.ai_settings = {
+            "profiles": profiles,
+            "request_retries": request_retries,
+            "book_analysis_concurrency": book_analysis_concurrency,
+            "book_analysis_fast_extra_body": book_analysis_fast_extra_text,
+            "book_analysis_final_extra_body": book_analysis_final_extra_text,
+            "prompt_settings_version": PROMPT_SETTINGS_VERSION,
+            "prompt_overrides": getattr(self, "prompt_overrides", normalize_prompt_overrides({}, PROMPT_SETTING_ENTRIES)),
+        }
         writing_service = self._service_from_profile(profiles.get("writing", {}))
         self.ai_service.configure(
             api_key=writing_service.api_key,
             base_url=writing_service.base_url,
             model=writing_service.model,
         )
+        self.ai_service.set_prompt_overrides(getattr(self, "prompt_overrides", {}))
         self._set_status("")
 
     def _build_ui(self) -> None:
-        self.setWindowTitle("Simple AI Novel App - PyQt6 Workbench")
+        self.setWindowTitle(APP_DISPLAY_NAME)
         self.resize(1540, 940)
         self.setMinimumSize(1024, 720)
 
@@ -1009,7 +1505,6 @@ class NovelQtMainWindow(QMainWindow):
         for label, callback in [
             ("折叠导航", self._toggle_library_collapsed),
             ("详情抽屉", lambda: self._open_drawer("details")),
-            ("人物星图", lambda: self._open_drawer("star")),
             ("生成记录", lambda: self._open_drawer("review")),
             ("任务抽屉", lambda: self._open_drawer("tasks")),
             ("专注写作", self._toggle_focus_mode),
@@ -1023,20 +1518,16 @@ class NovelQtMainWindow(QMainWindow):
         self.toolbar_buttons.append(view_button)
 
         settings_menu = QMenu(self)
-        self.correction_ai_action = QAction("纠错启用 AI 检测", self)
-        self.correction_ai_action.setCheckable(True)
-        self.correction_ai_action.setChecked(self.correction_ai_enabled)
-        self.correction_ai_action.triggered.connect(self._toggle_correction_ai_detection)
         self.auto_save_action = QAction("启用定时保存", self)
         self.auto_save_action.setCheckable(True)
         self.auto_save_action.setChecked(self.auto_save_enabled)
         self.auto_save_action.triggered.connect(self._toggle_auto_save)
         self.auto_save_interval_action = QAction(self._auto_save_interval_action_text(), self)
         self.auto_save_interval_action.triggered.connect(self._configure_auto_save_interval)
-        settings_menu.addAction(self.correction_ai_action)
-        settings_menu.addSeparator()
         settings_menu.addAction(self.auto_save_action)
         settings_menu.addAction(self.auto_save_interval_action)
+        settings_menu.addSeparator()
+        settings_menu.addAction(QAction("Agent 与提示词配置", self, triggered=self._open_prompt_settings))
         settings_button = QPushButton("设定 ▾")
         settings_button.setMenu(settings_menu)
         self.toolbar_box.addWidget(settings_button)
@@ -1290,13 +1781,36 @@ class NovelQtMainWindow(QMainWindow):
         cover_layout.addLayout(cover_buttons)
 
         outline_box = QVBoxLayout()
+        outline_header = QHBoxLayout()
         label = QLabel("大纲")
         label.setObjectName("SectionTitle")
+        self.outline_template_btn = QPushButton("重置书籍模板")
+        self.outline_template_btn.clicked.connect(self._fill_book_outline_template)
+        self.outline_markdown_toggle_btn = QPushButton("Markdown")
+        self.outline_markdown_toggle_btn.setObjectName("TinyButton")
+        self.outline_markdown_toggle_btn.clicked.connect(lambda: self._toggle_markdown_view("outline"))
+        self.outline_checkbox_btn = QPushButton("勾选")
+        self.outline_checkbox_btn.setObjectName("TinyButton")
+        self.outline_checkbox_btn.clicked.connect(lambda: self._toggle_markdown_checkbox("outline"))
+        outline_header.addWidget(label, 1)
+        outline_header.addWidget(self.outline_markdown_toggle_btn)
+        outline_header.addWidget(self.outline_checkbox_btn)
+        outline_header.addWidget(self.outline_template_btn)
         self.outline_editor = QPlainTextEdit()
         self.outline_editor.textChanged.connect(self._on_editor_changed)
+        self.outline_editor.textChanged.connect(self._refresh_outline_markdown_preview)
         self.outline_editor.selectionChanged.connect(self._update_selection_count)
-        outline_box.addWidget(label)
-        outline_box.addWidget(self.outline_editor, 1)
+        self.book_outline_form = BookOutlineFormWidget()
+        self.book_outline_form.changed.connect(self._on_book_outline_form_changed)
+        self.outline_markdown_preview = QTextEdit()
+        self.outline_markdown_preview.setReadOnly(True)
+        self.outline_markdown_preview.setPlaceholderText("Markdown 预览")
+        self.outline_markdown_stack = QStackedWidget()
+        self.outline_markdown_stack.addWidget(self.book_outline_form)
+        self.outline_markdown_stack.addWidget(self.outline_editor)
+        self.outline_markdown_stack.addWidget(self.outline_markdown_preview)
+        outline_box.addLayout(outline_header)
+        outline_box.addWidget(self.outline_markdown_stack, 1)
         content_row.addWidget(self.book_cover_panel)
         content_row.addLayout(outline_box, 1)
         layout.addLayout(content_row, 1)
@@ -1325,27 +1839,7 @@ class NovelQtMainWindow(QMainWindow):
         return page
 
     def _build_drawer_tabs(self) -> QTabWidget:
-        tabs = QTabWidget()
-        tabs.setObjectName("DrawerTabs")
-        tabs.setDocumentMode(True)
-        tabs.setUsesScrollButtons(True)
-        tabs.setElideMode(Qt.TextElideMode.ElideRight)
-        self.drawer_tab_indexes = {}
-
-        def add_tab(key: str, widget: QWidget, label: str) -> None:
-            self.drawer_tab_indexes[key] = tabs.addTab(widget, label)
-
-        add_tab("overview", self._build_overview_tab(), "概览")
-        add_tab("shortcuts", self._build_shortcuts_tab(), "快键")
-        add_tab("outline", self._build_outline_tab(), "生成")
-        add_tab("characters", self._build_characters_tab(), "人物")
-        add_tab("star", self._build_star_graph_tab(), "星图")
-        add_tab("world", self._build_world_tab(), "世界观")
-        add_tab("skills", self._build_skills_tab(), "Skills")
-        add_tab("review", self._build_review_tab(), "记录")
-        add_tab("tasks", self._build_task_tab(), "任务")
-        tabs.currentChanged.connect(lambda _index: self._on_drawer_tab_changed())
-        return tabs
+        return self.drawer_controller.build_tabs()
 
     def _build_drawer_title_bar(self) -> QFrame:
         bar = QFrame()
@@ -1365,336 +1859,34 @@ class NovelQtMainWindow(QMainWindow):
         return bar
 
     def _make_drawer_page(self) -> QWidget:
-        page = QWidget()
-        page.setObjectName("DrawerPage")
-        page.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        return page
+        return self.drawer_controller.make_page()
 
     def _build_outline_tab(self) -> QWidget:
-        page = self._make_drawer_page()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(8)
-
-        header = QHBoxLayout()
-        self.outline_tab_title = QLabel("章节生成大纲")
-        self.outline_tab_title.setObjectName("SectionTitle")
-        self.outline_action_btn = QPushButton("长篇生成")
-        self.outline_action_btn.clicked.connect(self._on_outline_action_btn)
-        self.outline_sync_btn = QPushButton("同步章节大纲")
-        self.outline_sync_btn.clicked.connect(self._refresh_summary)
-        header.addWidget(self.outline_tab_title, 1)
-        header.addWidget(self.outline_action_btn)
-        header.addWidget(self.outline_sync_btn)
-        layout.addLayout(header)
-
-        self.chapter_outline_editor = QPlainTextEdit()
-        self.chapter_outline_editor.setPlaceholderText("本章生成时直接对接的目标、冲突、场景和结尾钩子。")
-        self.chapter_outline_editor.textChanged.connect(self._on_editor_changed)
-        self.chapter_outline_editor.selectionChanged.connect(self._update_selection_count)
-        layout.addWidget(self.chapter_outline_editor, 1)
-
-        self.volume_outline_editor = QPlainTextEdit()
-        self.volume_outline_editor.setPlaceholderText("为这一卷设定主线推进、分章规划和节奏安排。")
-        self.volume_outline_editor.textChanged.connect(self._on_editor_changed)
-        layout.addWidget(self.volume_outline_editor, 1)
-        self.volume_outline_editor.hide()
-        return page
+        return drawer_pages.build_outline_tab(self)
 
     def _build_overview_tab(self) -> QWidget:
-        page = self._make_drawer_page()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(8)
-
-        title_row = QHBoxLayout()
-        self.overview_title = QLabel("")
-        self.overview_title.setObjectName("SectionTitle")
-        self.ai_summarize_btn = QPushButton("AI 总结全书")
-        self.ai_summarize_btn.clicked.connect(self._start_ai_book_summary)
-        title_row.addWidget(self.overview_title, 1)
-        title_row.addWidget(self.ai_summarize_btn)
-        layout.addLayout(title_row)
-
-        self.overview_meta = QLabel("")
-        self.overview_meta.setObjectName("MetaLabel")
-        self.sourcebook_preview = QPlainTextEdit()
-        self.sourcebook_preview.setReadOnly(True)
-        layout.addWidget(self.overview_meta)
-        layout.addWidget(self.sourcebook_preview, 1)
-        return page
+        return drawer_pages.build_overview_tab(self)
 
     def _build_shortcuts_tab(self) -> QWidget:
-        page = self._make_drawer_page()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(8)
-
-        header = QHBoxLayout()
-        title = QLabel("人名快键")
-        title.setObjectName("SectionTitle")
-        header.addWidget(title, 1)
-        layout.addLayout(header)
-
-        hint = QLabel("格式：Ctrl+D = '张三'   按压快捷键时在正文光标处插入对应人名。")
-        hint.setObjectName("MetaLabel")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-
-        self.shortcuts_list = QListWidget()
-        self.shortcuts_list.setObjectName("DrawerList")
-        layout.addWidget(self.shortcuts_list, 1)
-
-        add_row = QHBoxLayout()
-        add_row.setSpacing(6)
-        self.shortcut_key_input = QLineEdit()
-        self.shortcut_key_input.setPlaceholderText("快捷键（如 Ctrl+D）")
-        self.shortcut_key_input.setMaximumWidth(150)
-        self.shortcut_name_input = QLineEdit()
-        self.shortcut_name_input.setPlaceholderText("人名（如 张三）")
-        add_row.addWidget(self.shortcut_key_input)
-        add_row.addWidget(self.shortcut_name_input, 1)
-        layout.addLayout(add_row)
-
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(8)
-        add_btn = QPushButton("➕ 新增")
-        add_btn.clicked.connect(self._add_name_shortcut)
-        del_btn = QPushButton("🗑 删除")
-        del_btn.clicked.connect(self._delete_name_shortcut)
-        pick_btn = QPushButton("从人物列表选取")
-        pick_btn.clicked.connect(self._pick_characters_for_shortcuts)
-        btn_row.addWidget(add_btn)
-        btn_row.addWidget(del_btn)
-        btn_row.addWidget(pick_btn)
-        btn_row.addStretch(1)
-        layout.addLayout(btn_row)
-        return page
+        return drawer_pages.build_shortcuts_tab(self)
 
     def _build_characters_tab(self) -> QWidget:
-        page = self._make_drawer_page()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(10)
-        self.characters_list = QListWidget()
-        self.characters_list.setObjectName("DrawerList")
-        self.characters_list.currentItemChanged.connect(self._on_character_selected)
-        editor_row = QHBoxLayout()
-        editor_row.setSpacing(12)
-        portrait_box = QVBoxLayout()
-        self.character_image_preview = QLabel("立绘")
-        self.character_image_preview.setObjectName("ImagePreview")
-        self.character_image_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.character_image_preview.setMinimumSize(120, 168)
-        self.character_image_preview.setMaximumSize(170, 240)
-        portrait_buttons = QHBoxLayout()
-        portrait_choose = QPushButton("选择")
-        portrait_clear = QPushButton("清除")
-        portrait_choose.clicked.connect(self._choose_character_image)
-        portrait_clear.clicked.connect(self._clear_character_image)
-        portrait_buttons.addWidget(portrait_choose)
-        portrait_buttons.addWidget(portrait_clear)
-        portrait_box.addWidget(self.character_image_preview)
-        portrait_box.addLayout(portrait_buttons)
-        form = QFormLayout()
-        self.character_name = QLineEdit()
-        self.character_role = QLineEdit()
-        self.character_profile = QPlainTextEdit()
-        self.character_profile.setMinimumHeight(360)
-        self.character_name.textChanged.connect(self._mark_character_form_dirty)
-        self.character_role.textChanged.connect(self._mark_character_form_dirty)
-        self.character_profile.textChanged.connect(self._mark_character_form_dirty)
-        form.addRow("姓名", self.character_name)
-        form.addRow("角色", self.character_role)
-        form.addRow("人物设定", self.character_profile)
-        buttons = QHBoxLayout()
-        new_btn = QPushButton("新建")
-        save_btn = QPushButton("保存")
-        import_btn = QPushButton("导入文件")
-        del_btn = QPushButton("删除")
-        del_btn.setObjectName("DangerButton")
-        new_btn.clicked.connect(self._create_character)
-        save_btn.clicked.connect(self._save_character)
-        import_btn.clicked.connect(self._import_character_file)
-        del_btn.clicked.connect(self._delete_character)
-        buttons.addWidget(new_btn)
-        buttons.addWidget(save_btn)
-        buttons.addWidget(import_btn)
-        buttons.addWidget(del_btn)
-        editor_row.addLayout(portrait_box)
-        editor_row.addLayout(form, 1)
-        layout.addLayout(editor_row)
-        layout.addLayout(buttons)
-        self.character_list_toggle = QPushButton("收起人物列表")
-        self.character_list_toggle.setCheckable(True)
-        self.character_list_toggle.toggled.connect(self._toggle_character_list_collapsed)
-        layout.addWidget(self.character_list_toggle)
-        layout.addWidget(self.characters_list, 1)
-        return page
+        return drawer_pages.build_characters_tab(self)
 
-    def _build_star_graph_tab(self) -> QWidget:
-        from novel_app.qt.star_graph_style import StyleManager
-
-        page = self._make_drawer_page()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(8, 8, 8, 8)
-        self.star_graph = StarGraphWidget()
-        if hasattr(self, "tokens"):
-            self.star_graph.apply_theme(self.tokens.surface, self.tokens.border)
-        self.star_graph_style_manager = StyleManager(self.database, self.state.selected_book_id)
-        self.star_graph_style_manager.initialize_defaults()
-        self.star_graph.set_style_manager(self.star_graph_style_manager)
-        self.star_graph.characterMoved.connect(self._move_character_in_graph)
-        self.star_graph.editCharacterRequested.connect(self._edit_character_from_graph)
-        self.star_graph.changeCharacterStyleRequested.connect(self._change_character_style_from_graph)
-        layout.addWidget(self.star_graph, 1)
-        return page
+    def _ensure_character_detail_dialog(self) -> CharacterDetailDialog:
+        return drawer_pages.ensure_character_detail_dialog(self)
 
     def _build_world_tab(self) -> QWidget:
-        page = self._make_drawer_page()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(14, 14, 14, 14)
-        self.world_search = QLineEdit()
-        self.world_search.setPlaceholderText("搜索世界观…")
-        self.world_search.setClearButtonEnabled(True)
-        self.world_search.textChanged.connect(self._filter_world_list)
-        layout.addWidget(self.world_search)
-        self.world_list = QListWidget()
-        self.world_list.setObjectName("DrawerList")
-        self.world_list.currentItemChanged.connect(self._on_world_selected)
-        form = QFormLayout()
-        self.world_name = QLineEdit()
-        self.world_category = QLineEdit()
-        self.world_content = QPlainTextEdit()
-        self.world_name.textChanged.connect(self._mark_world_form_dirty)
-        self.world_category.textChanged.connect(self._mark_world_form_dirty)
-        self.world_content.textChanged.connect(self._mark_world_form_dirty)
-        form.addRow("名称", self.world_name)
-        form.addRow("分类", self.world_category)
-        form.addRow("内容", self.world_content)
-        buttons = QHBoxLayout()
-        new_btn = QPushButton("新建")
-        save_btn = QPushButton("保存")
-        import_btn = QPushButton("导入文件")
-        del_btn = QPushButton("删除")
-        del_btn.setObjectName("DangerButton")
-        new_btn.clicked.connect(self._create_world_entry)
-        save_btn.clicked.connect(self._save_world_entry)
-        import_btn.clicked.connect(self._import_world_file)
-        del_btn.clicked.connect(self._delete_world_entry)
-        buttons.addWidget(new_btn)
-        buttons.addWidget(save_btn)
-        buttons.addWidget(import_btn)
-        buttons.addWidget(del_btn)
-        layout.addWidget(self.world_list, 1)
-        layout.addLayout(form)
-        layout.addLayout(buttons)
-        return page
+        return drawer_pages.build_world_tab(self)
 
     def _build_skills_tab(self) -> QWidget:
-        page = self._make_drawer_page()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(14, 14, 14, 14)
-        self.enabled_skills_list = QListWidget()
-        self.enabled_skills_list.setObjectName("DrawerList")
-        self.skill_preview = QPlainTextEdit()
-        self.skill_preview.setReadOnly(True)
-        manage = QPushButton("完整管理")
-        manage.clicked.connect(self._open_book_settings)
-        layout.addWidget(QLabel("已启用 Skills（全局 / 书籍 / 章节）"))
-        layout.addWidget(self.enabled_skills_list, 1)
-        layout.addWidget(self.skill_preview, 1)
-        layout.addWidget(manage)
-        self.enabled_skills_list.currentItemChanged.connect(self._on_enabled_skill_selected)
-        return page
+        return drawer_pages.build_skills_tab(self)
 
     def _build_review_tab(self) -> QWidget:
-        page = self._make_drawer_page()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(8)
-
-        header = QHBoxLayout()
-        title = QLabel("生成记录")
-        title.setObjectName("SectionTitle")
-        run_btn = QPushButton("长篇生成")
-        run_btn.clicked.connect(self._start_multi_agent_generation)
-        header.addWidget(title, 1)
-        header.addWidget(run_btn)
-
-        self.review_templates_label = QLabel("")
-        self.review_templates_label.setObjectName("MetaLabel")
-        self.review_templates_label.setWordWrap(True)
-        self.review_runs_list = QListWidget()
-        self.review_runs_list.setObjectName("DrawerList")
-        self.review_runs_list.currentItemChanged.connect(self._on_review_run_selected)
-        self.review_detail = QPlainTextEdit()
-        self.review_detail.setReadOnly(True)
-        self.review_detail.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
-
-        actions = QHBoxLayout()
-        view_snapshot = QPushButton("查看快照")
-        restore_snapshot = QPushButton("恢复快照")
-        copy_truth = QPushButton("复制 Truth File")
-        restore_snapshot.setObjectName("DangerButton")
-        view_snapshot.clicked.connect(self._view_selected_review_snapshot)
-        restore_snapshot.clicked.connect(self._restore_selected_review_snapshot)
-        copy_truth.clicked.connect(self._copy_selected_review_truth_file)
-        actions.addWidget(view_snapshot)
-        actions.addWidget(restore_snapshot)
-        actions.addWidget(copy_truth)
-
-        layout.addLayout(header)
-        layout.addWidget(self.review_templates_label)
-        layout.addWidget(self.review_runs_list, 1)
-        layout.addWidget(self.review_detail, 2)
-        layout.addLayout(actions)
-        return page
+        return drawer_pages.build_review_tab(self)
 
     def _build_task_tab(self) -> QWidget:
-        page = self._make_drawer_page()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(8)
-        self.task_summary_panel = QFrame()
-        self.task_summary_panel.setObjectName("Card")
-        self.task_summary_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.task_summary_panel.setMinimumHeight(0)
-        self.task_summary_panel.setMaximumHeight(0)
-        self.task_summary_panel.setVisible(False)
-        summary_layout = QVBoxLayout(self.task_summary_panel)
-        summary_layout.setContentsMargins(12, 10, 12, 10)
-        summary_layout.setSpacing(6)
-        summary_header = QHBoxLayout()
-        self.task_summary_title = QLabel("任务队列")
-        self.task_summary_title.setObjectName("SectionTitle")
-        self.task_summary_badge = QLabel("空闲")
-        self.task_summary_badge.setObjectName("MetaLabel")
-        summary_header.addWidget(self.task_summary_title, 1)
-        summary_header.addWidget(self.task_summary_badge)
-        self.task_summary_detail = QLabel("暂无运行任务")
-        self.task_summary_detail.setObjectName("MetaLabel")
-        self.task_summary_detail.setWordWrap(True)
-        summary_layout.addLayout(summary_header)
-        summary_layout.addWidget(self.task_summary_detail)
-        self.task_state = QLabel("空闲")
-        self.task_state.setObjectName("SectionTitle")
-        self.task_progress = QProgressBar()
-        self.task_progress.setRange(0, 1)
-        self.task_progress.setValue(0)
-        self.task_log = QPlainTextEdit()
-        self.task_log.setReadOnly(True)
-        self.task_log.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
-        self.task_log.setMinimumWidth(260)
-        self.task_log.textChanged.connect(lambda: self.task_log.moveCursor(QTextCursor.MoveOperation.End))
-        self.cancel_task_button = QPushButton("停止任务")
-        self.cancel_task_button.clicked.connect(self._cancel_task)
-        self.cancel_task_button.setEnabled(False)
-        layout.addWidget(self.task_state)
-        layout.addWidget(self.task_progress)
-        layout.addWidget(self.task_log, 1)
-        layout.addWidget(self.cancel_task_button)
-        return page
+        return drawer_pages.build_task_tab(self)
 
     def _apply_theme(self) -> None:
         self.tokens = self._build_theme_tokens()
@@ -2016,7 +2208,13 @@ class NovelQtMainWindow(QMainWindow):
         self._save_ui_settings()
         self._set_status("全部配置已重置为默认值。")
 
-    def _load_library_tree(self, preferred_key: tuple[str, int | None, int | None] | None = None) -> None:
+    def _load_library_tree(
+        self,
+        preferred_key: tuple[str, int | None, int | None] | None = None,
+        *,
+        preserve_expansion: bool = True,
+    ) -> None:
+        expanded_keys = self._collect_expanded_tree_keys() if preserve_expansion else set()
         self.tree_model.removeRows(0, self.tree_model.rowCount())
         root = self.tree_model.invisibleRootItem()
         compact_rows: list[tuple[int, str]] = []
@@ -2049,10 +2247,12 @@ class NovelQtMainWindow(QMainWindow):
                 book_item.appendRow(group_item)
                 for chapter in chapters_by_volume.get(None, []):
                     group_item.appendRow(self._make_chapter_tree_item(chapter))
-        self.library_tree.expandAll()
+        self.library_tree.collapseAll()
+        self._restore_expanded_tree_keys(expanded_keys)
         self._refresh_library_compact_list(compact_rows)
         target = preferred_key or self.current_tree_key
         if target:
+            self._expand_to_key(target)
             self._select_tree_key(target)
         else:
             self._update_library_create_button()
@@ -2238,13 +2438,55 @@ class NovelQtMainWindow(QMainWindow):
             self.library_compact_list.addItem(item)
         self.library_compact_list.blockSignals(False)
 
+    def _tree_item_key(self, item: QStandardItem | None) -> tuple[str, int | None, int | None] | None:
+        if item is None:
+            return None
+        kind = item.data(KIND_ROLE)
+        if not kind:
+            return None
+        return (str(kind), item.data(ID_ROLE), item.data(GROUP_BOOK_ROLE))
+
+    def _collect_expanded_tree_keys(self) -> set[tuple[str, int | None, int | None]]:
+        expanded_keys: set[tuple[str, int | None, int | None]] = set()
+        if not hasattr(self, "library_tree") or not hasattr(self, "tree_model"):
+            return expanded_keys
+
+        def walk(parent: QStandardItem) -> None:
+            for row in range(parent.rowCount()):
+                item = parent.child(row)
+                if item is None:
+                    continue
+                key = self._tree_item_key(item)
+                index = self.tree_model.indexFromItem(item)
+                if key and self.library_tree.isExpanded(index):
+                    expanded_keys.add(key)
+                walk(item)
+
+        walk(self.tree_model.invisibleRootItem())
+        return expanded_keys
+
+    def _restore_expanded_tree_keys(self, expanded_keys: set[tuple[str, int | None, int | None]]) -> None:
+        for key in expanded_keys:
+            item = self._find_tree_item(key)
+            if item is None:
+                continue
+            index = self.tree_model.indexFromItem(item)
+            self.library_tree.setExpanded(index, True)
+
     def _tree_key_from_index(self, index) -> tuple[str, int | None, int | None] | None:
         if not index.isValid():
             return None
-        item = self.tree_model.itemFromIndex(index)
+        return self._tree_item_key(self.tree_model.itemFromIndex(index))
+
+    def _expand_to_key(self, key: tuple[str, int | None, int | None]) -> None:
+        item = self._find_tree_item(key)
         if item is None:
-            return None
-        return (str(item.data(KIND_ROLE)), item.data(ID_ROLE), item.data(GROUP_BOOK_ROLE))
+            return
+        parent = item.parent()
+        while parent is not None:
+            index = self.tree_model.indexFromItem(parent)
+            self.library_tree.expand(index)
+            parent = parent.parent()
 
     def _select_tree_key(self, key: tuple[str, int | None, int | None]) -> None:
         item = self._find_tree_item(key)
@@ -2292,7 +2534,9 @@ class NovelQtMainWindow(QMainWindow):
         def walk(parent: QStandardItem) -> QStandardItem | None:
             for row in range(parent.rowCount()):
                 item = parent.child(row)
-                if (str(item.data(KIND_ROLE)), item.data(ID_ROLE), item.data(GROUP_BOOK_ROLE)) == key:
+                if item is None:
+                    continue
+                if self._tree_item_key(item) == key:
                     return item
                 found = walk(item)
                 if found:
@@ -2337,10 +2581,13 @@ class NovelQtMainWindow(QMainWindow):
         kind = self.state.current_node_kind
         if kind == "book":
             self.library_create_button.setText("新建卷")
+            self.library_create_button.setEnabled(True)
         elif kind in {"volume", "group", "chapter"} and self.state.selected_book_id:
             self.library_create_button.setText("新建章节")
+            self.library_create_button.setEnabled(True)
         else:
             self.library_create_button.setText("新建书籍")
+            self.library_create_button.setEnabled(True)
 
     def _confirm_editor_navigation(self) -> bool:
         if not self.state.editor_dirty:
@@ -2375,6 +2622,11 @@ class NovelQtMainWindow(QMainWindow):
     def _confirm_side_form_navigation(self) -> bool:
         return self._confirm_character_edit_navigation() and self._confirm_world_edit_navigation()
 
+    def _book_outline_volume_specs(self, book_id: int | None) -> list[dict[str, Any]]:
+        if not book_id:
+            return []
+        return [row_to_dict(volume) for volume in self.database.list_volumes(book_id)]
+
     def _load_book(self, book_id: int) -> None:
         book = self.database.get_book(book_id)
         if not book:
@@ -2390,9 +2642,17 @@ class NovelQtMainWindow(QMainWindow):
         self.loaded_chapter_summary_text = ""
         self._set_editor_title(str(data["title"]), str(data["title"]))
         self.outline_editor.setReadOnly(False)
+        self.outline_template_btn.setVisible(True)
+        self.outline_markdown_toggle_btn.setVisible(True)
+        self.outline_checkbox_btn.setVisible(False)
         self.loading_editor = True
-        self.outline_editor.setPlainText(str(data.get("outline_text", "")))
+        volume_specs = self._book_outline_volume_specs(book_id)
+        outline_data = self.database.get_book_outline_form(book_id)
+        self.book_outline_form.set_data(outline_data, self.state.selected_book_title, volume_specs)
+        self.outline_editor.setPlainText(book_outline_form_to_markdown(outline_data, self.state.selected_book_title, volume_specs))
         self.loading_editor = False
+        self._refresh_outline_markdown_preview()
+        self._set_markdown_view_mode("outline", False)
         self._sync_editor_text_lengths()
         self.stack.setCurrentWidget(self.outline_page)
         self._clear_ai_span_rendering()
@@ -2420,9 +2680,15 @@ class NovelQtMainWindow(QMainWindow):
         self.loaded_chapter_summary_text = ""
         self._set_editor_title(str(data["title"]), f"{self.state.selected_book_title} / {data['title']}")
         self.outline_editor.setReadOnly(False)
+        self.outline_template_btn.setVisible(False)
+        self.outline_markdown_toggle_btn.setVisible(False)
+        self.outline_checkbox_btn.setVisible(False)
+        self._set_markdown_view_mode("outline", False)
         self.loading_editor = True
         self.outline_editor.setPlainText(str(data.get("outline_text", "")))
         self.loading_editor = False
+        self.outline_markdown_stack.setCurrentWidget(self.outline_editor)
+        self._refresh_outline_markdown_preview()
         self._sync_editor_text_lengths()
         self.stack.setCurrentWidget(self.outline_page)
         self._clear_ai_span_rendering()
@@ -2442,9 +2708,15 @@ class NovelQtMainWindow(QMainWindow):
         self.loaded_chapter_content = ""
         self.loaded_chapter_summary_text = ""
         self._set_editor_title("未分卷章节", f"{self.state.selected_book_title} / 未分卷")
+        self.outline_template_btn.setVisible(False)
+        self.outline_markdown_toggle_btn.setVisible(False)
+        self.outline_checkbox_btn.setVisible(False)
+        self._set_markdown_view_mode("outline", False)
         self.loading_editor = True
         self.outline_editor.setPlainText("")
         self.loading_editor = False
+        self.outline_markdown_stack.setCurrentWidget(self.outline_editor)
+        self._refresh_outline_markdown_preview()
         self._sync_editor_text_lengths()
         self.stack.setCurrentWidget(self.outline_page)
         self.outline_editor.setReadOnly(True)
@@ -2458,6 +2730,8 @@ class NovelQtMainWindow(QMainWindow):
         data = row_to_dict(chapter)
         self._load_book(int(data["book_id"]))
         self.outline_editor.setReadOnly(False)
+        self.chapter_outline_editor.setReadOnly(False)
+        self.content_editor.setReadOnly(False)
         self.state.current_node_kind = "chapter"
         self.state.selected_chapter_id = chapter_id
         self.state.selected_volume_id = int(data["volume_id"]) if data.get("volume_id") is not None else None
@@ -2488,15 +2762,282 @@ class NovelQtMainWindow(QMainWindow):
         self.book_skills = [dict(item) for item in self.database.list_bound_skills_for_book(book_id)]
         self.characters = [dict(item) for item in self.database.list_characters(book_id)]
         self.world_entries = [dict(item) for item in self.database.list_world_entries(book_id)]
+        self._load_world_form_for_book(book_id)
         if self.state.selected_chapter_id:
             self.bound_skills = [dict(item) for item in self.database.list_bound_skills_for_chapter(self.state.selected_chapter_id)]
         else:
             self.bound_skills = []
 
+    def _load_world_form_for_book(self, book_id: int | None) -> None:
+        if not book_id or not hasattr(self, "world_form"):
+            return
+        if getattr(self, "_world_form_dirty", False) and getattr(self, "_world_form_book_id", None) == book_id:
+            return
+        self.world_form.set_data(self.database.get_book_world_form(book_id))
+        self._world_form_book_id = book_id
+        self._refresh_world_markdown_preview()
+        if hasattr(self, "world_markdown_stack"):
+            self._set_markdown_view_mode("world", False)
+        self._world_form_dirty = False
+
     def _set_editor_title(self, title: str, path: str) -> None:
         self.editor_title.setText(title)
         self.editor_path.setText(path)
         self._update_ai_probability_badge("none", 0, visible=False)
+
+    def _set_markdown_preview(self, preview: QTextEdit, text: str) -> None:
+        try:
+            preview.setMarkdown(str(text or ""))
+        except Exception:
+            preview.setPlainText(str(text or ""))
+
+    def _current_book_outline_markdown(self) -> str:
+        if self.state.editor_scope_kind == "book" and hasattr(self, "book_outline_form"):
+            return self.book_outline_form.to_markdown(self.state.selected_book_title)
+        return self.outline_editor.toPlainText()
+
+    def _current_world_markdown(self) -> str:
+        if hasattr(self, "world_form"):
+            return self.world_form.to_markdown()
+        if self.state.selected_book_id:
+            book = self.database.get_book(self.state.selected_book_id)
+            if book:
+                return str(book["world_text"] or "")
+        return ""
+
+    def _on_book_outline_form_changed(self) -> None:
+        markdown = self._current_book_outline_markdown()
+        self.outline_editor.blockSignals(True)
+        try:
+            self.outline_editor.setPlainText(markdown)
+        finally:
+            self.outline_editor.blockSignals(False)
+        self._refresh_outline_markdown_preview()
+        self._on_editor_changed()
+
+    def _on_world_form_changed(self) -> None:
+        self._refresh_world_markdown_preview()
+        self._mark_world_form_dirty()
+
+    def _current_character_markdown(self) -> str:
+        if hasattr(self, "character_profile_form"):
+            return self.character_profile_form.to_markdown(self.character_name.text(), self.character_role.text())
+        if self.selected_character_id:
+            character = self.database.get_character(self.selected_character_id)
+            if character:
+                return str(character["profile_text"] or "")
+        return ""
+
+    def _on_character_form_changed(self) -> None:
+        self._refresh_character_markdown_preview()
+        self._mark_character_form_dirty()
+
+    def _on_character_identity_changed(self) -> None:
+        if getattr(self, "loading_editor", False):
+            return
+        if hasattr(self, "character_profile_form"):
+            self.character_profile_form.refresh_identity(self.character_name.text(), self.character_role.text())
+        self._refresh_character_markdown_preview()
+        self._mark_character_form_dirty()
+
+    def _refresh_outline_markdown_preview(self) -> None:
+        if hasattr(self, "outline_markdown_preview"):
+            self._set_markdown_preview(self.outline_markdown_preview, self._current_book_outline_markdown())
+
+    def _refresh_character_markdown_preview(self) -> None:
+        if hasattr(self, "character_profile_preview"):
+            self._set_markdown_preview(self.character_profile_preview, self._current_character_markdown())
+
+    def _refresh_world_markdown_preview(self) -> None:
+        if hasattr(self, "world_content_preview"):
+            self._set_markdown_preview(self.world_content_preview, self._current_world_markdown())
+
+    def _toggle_markdown_view(self, target: str) -> None:
+        if target == "outline" and self.state.editor_scope_kind == "book":
+            self._set_markdown_view_mode("outline", self.outline_markdown_stack.currentWidget() is self.book_outline_form)
+            return
+        if target == "character" and hasattr(self, "character_profile_form"):
+            self._set_markdown_view_mode("character", self.character_markdown_stack.currentWidget() is self.character_profile_form)
+            return
+        if target == "world" and hasattr(self, "world_form"):
+            self._set_markdown_view_mode("world", self.world_markdown_stack.currentWidget() is self.world_form)
+            return
+        stack, editor, preview, button = self._markdown_widgets(target)
+        if not stack or not editor or not preview or not button:
+            return
+        self._set_markdown_view_mode(target, stack.currentWidget() is editor)
+
+    def _set_markdown_view_mode(self, target: str, preview_mode: bool) -> None:
+        if target == "outline" and hasattr(self, "book_outline_form") and self.state.editor_scope_kind == "book":
+            if preview_mode:
+                self._set_markdown_preview(self.outline_markdown_preview, self._current_book_outline_markdown())
+                self.outline_markdown_stack.setCurrentWidget(self.outline_markdown_preview)
+                self.outline_markdown_toggle_btn.setText("表单")
+            else:
+                self.outline_markdown_stack.setCurrentWidget(self.book_outline_form)
+                self.outline_markdown_toggle_btn.setText("Markdown")
+            return
+        if target == "character" and hasattr(self, "character_profile_form"):
+            if preview_mode:
+                self._set_markdown_preview(self.character_profile_preview, self._current_character_markdown())
+                self.character_markdown_stack.setCurrentWidget(self.character_profile_preview)
+                self.character_markdown_toggle_btn.setText("表单")
+            else:
+                self.character_markdown_stack.setCurrentWidget(self.character_profile_form)
+                self.character_markdown_toggle_btn.setText("Markdown")
+            return
+        if target == "world" and hasattr(self, "world_form"):
+            if preview_mode:
+                self._set_markdown_preview(self.world_content_preview, self._current_world_markdown())
+                self.world_markdown_stack.setCurrentWidget(self.world_content_preview)
+                self.world_markdown_toggle_btn.setText("表单")
+            else:
+                self.world_markdown_stack.setCurrentWidget(self.world_form)
+                self.world_markdown_toggle_btn.setText("Markdown")
+            return
+        stack, editor, preview, button = self._markdown_widgets(target)
+        if not stack or not editor or not preview or not button:
+            return
+        if preview_mode:
+            self._set_markdown_preview(preview, editor.toPlainText())
+            stack.setCurrentWidget(preview)
+            button.setText("Markdown")
+        else:
+            stack.setCurrentWidget(editor)
+            button.setText("预览")
+
+    def _markdown_widgets(self, target: str) -> tuple[QStackedWidget | None, QPlainTextEdit | None, QTextEdit | None, QPushButton | None]:
+        if target == "outline" and hasattr(self, "outline_markdown_stack"):
+            return self.outline_markdown_stack, self.outline_editor, self.outline_markdown_preview, self.outline_markdown_toggle_btn
+        return None, None, None, None
+
+    def _toggle_markdown_checkbox(self, target: str) -> None:
+        stack, editor, preview, _button = self._markdown_widgets(target)
+        if not stack or not editor:
+            return
+        if stack.currentWidget() is not editor:
+            self._set_markdown_view_mode(target, False)
+        if not self._toggle_markdown_checkbox_selection(editor):
+            return
+        if preview:
+            self._set_markdown_preview(preview, editor.toPlainText())
+        self._set_status("已切换勾选状态")
+
+    def _toggle_markdown_checkbox_selection(self, editor: QPlainTextEdit) -> bool:
+        text = editor.toPlainText()
+        cursor = editor.textCursor()
+        if not text:
+            editor.setPlainText("- [x] ")
+            return True
+
+        lines = text.splitlines(keepends=True)
+        if not lines:
+            return False
+
+        start = min(cursor.selectionStart(), len(text))
+        end = min(cursor.selectionEnd(), len(text))
+        end_for_line = max(start, end - 1) if end > start else start
+        start_line = min(text.count("\n", 0, start), len(lines) - 1)
+        end_line = min(text.count("\n", 0, end_for_line), len(lines) - 1)
+        changed = False
+        for line_index in range(start_line, end_line + 1):
+            original = lines[line_index]
+            body = original.rstrip("\r\n")
+            newline = original[len(body):]
+            toggled = self._toggle_markdown_checkbox_line(body)
+            if toggled != body:
+                lines[line_index] = toggled + newline
+                changed = True
+        if not changed:
+            return False
+
+        old_position = cursor.position()
+        old_anchor = cursor.anchor()
+        editor.setPlainText("".join(lines))
+        new_cursor = editor.textCursor()
+        text_length = len(editor.toPlainText())
+        new_cursor.setPosition(min(old_anchor, text_length))
+        new_cursor.setPosition(min(old_position, text_length), QTextCursor.MoveMode.KeepAnchor)
+        editor.setTextCursor(new_cursor)
+        return True
+
+    def _toggle_markdown_checkbox_line(self, line: str) -> str:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or stripped.startswith("```") or stripped in {"---", "***", "___"}:
+            return line
+        match = re.match(r"^(\s*(?:[-*+]\s+)?)\[( |x|X)\](.*)$", line)
+        if match:
+            next_box = "[x]" if match.group(2) == " " else "[ ]"
+            return f"{match.group(1)}{next_box}{match.group(3)}"
+        match = re.match(r"^(\s*)☐(.*)$", line)
+        if match:
+            return f"{match.group(1)}☑{match.group(2)}"
+        match = re.match(r"^(\s*)☑(.*)$", line)
+        if match:
+            return f"{match.group(1)}☐{match.group(2)}"
+        match = re.match(r"^(\s*)([-*+]\s+)(.*)$", line)
+        if match:
+            return f"{match.group(1)}{match.group(2)}[x] {match.group(3).lstrip()}"
+        indent_match = re.match(r"^(\s*)", line)
+        indent = indent_match.group(1) if indent_match else ""
+        return f"{indent}- [x] {line[len(indent):]}"
+
+    def _fill_book_outline_template(self) -> None:
+        if self.state.editor_scope_kind != "book":
+            info(self, "书籍模板", "请先选中书籍级大纲。")
+            return
+        if not confirm(self, "重置书籍模板", "当前书籍级设定会被完整空模板替换，确定继续吗？", danger=True):
+            return
+        volume_specs = self._book_outline_volume_specs(self.state.selected_book_id)
+        self.book_outline_form.set_data(
+            book_outline_form_defaults(self.state.selected_book_title, volume_specs),
+            self.state.selected_book_title,
+            volume_specs,
+        )
+        self._on_book_outline_form_changed()
+
+    def _fill_character_template(self) -> None:
+        if not hasattr(self, "character_profile_form"):
+            return
+        if getattr(self, "_character_form_dirty", False) and not confirm(
+            self,
+            "重置人物模板",
+            "当前人物卡会被完整空模板替换，确定继续吗？",
+            danger=True,
+        ):
+            return
+        self.character_profile_form.set_data(
+            character_profile_form_defaults(self.character_name.text(), self.character_role.text()),
+            self.character_name.text(),
+            self.character_role.text(),
+        )
+        self._on_character_form_changed()
+        self._set_markdown_view_mode("character", False)
+
+    def _fill_world_template(self) -> None:
+        if not hasattr(self, "world_form"):
+            return
+        if getattr(self, "_world_form_dirty", False) and not confirm(
+            self,
+            "重置世界观模板",
+            "当前世界观设定会被完整空模板替换，确定继续吗？",
+            danger=True,
+        ):
+            return
+        self.world_form.set_data(world_form_defaults())
+        self._on_world_form_changed()
+        self._set_markdown_view_mode("world", False)
+
+    def _replace_with_template(self, editor: QPlainTextEdit, template: str, label: str) -> None:
+        if editor.toPlainText().strip() and not confirm(
+            self,
+            f"填入{label}模板",
+            f"当前{label}内容会被模板替换，确定继续吗？",
+            danger=True,
+        ):
+            return
+        editor.setPlainText(template)
+        self._set_status(f"已填入{label} Markdown 模板")
 
     def _update_ai_probability_badge(self, level: str, probability: int, visible: bool = True) -> None:
         if not hasattr(self, "ai_probability_badge"):
@@ -2645,50 +3186,283 @@ class NovelQtMainWindow(QMainWindow):
                 self.content_label.show()
             self._set_status("正文已显示")
 
-    _search_matches: list = []
-
     def _show_search_bar(self) -> None:
-        if not hasattr(self, "content_editor"):
+        if not self.state.selected_book_id:
+            info(self, "查找", "请先选择一本书、一个卷或一个章节。")
             return
-        search_text = ""
-        if hasattr(self, "_search_input"):
-            search_text = self._search_input.text()
-        text, ok = QInputDialog.getText(self, "查找", "输入查找内容：", text=search_text)
-        if not ok or not text.strip():
+        if self.search_dialog is None:
+            self.search_dialog = SearchDialog(self)
+            self.search_dialog.destroyed.connect(lambda _obj=None: setattr(self, "search_dialog", None))
+        options, current_scope = self._search_scope_options()
+        self.search_dialog.set_scope_options(options, current_scope)
+        self.search_dialog.show()
+        self.search_dialog.raise_()
+        self.search_dialog.activateWindow()
+        self.search_dialog.focus_query()
+
+    def _search_scope_options(self) -> tuple[list[tuple[str, str]], str]:
+        options: list[tuple[str, str]] = []
+        book_id = self.state.selected_book_id
+        if not book_id:
+            return options, ""
+        default_scope = "book"
+        chapter_id = self.state.selected_chapter_id
+        volume_id = self.state.selected_volume_id
+        if self.state.current_node_kind == "chapter" and chapter_id:
+            chapter = self.database.get_chapter(chapter_id)
+            chapter_title = str(chapter["title"]) if chapter else "当前章节"
+            options.append(("chapter", f"当前章节：{chapter_title}"))
+            default_scope = "chapter"
+            if chapter and chapter["volume_id"] is not None:
+                volume_id = int(chapter["volume_id"])
+            elif chapter:
+                volume_id = None
+        if self.state.current_node_kind in {"volume", "group"}:
+            default_scope = "volume"
+        if volume_id:
+            volume = self.database.get_volume(volume_id)
+            volume_title = str(volume["title"]) if volume else "当前卷"
+            options.append(("volume", f"当前卷：{volume_title}"))
+        elif self.state.current_node_kind == "group" or (chapter_id and not volume_id):
+            options.append(("volume", "未分卷章节"))
+        book_label = self.state.selected_book_title or "当前书籍"
+        options.append(("book", f"当前书籍：{book_label}"))
+        seen: set[str] = set()
+        unique_options: list[tuple[str, str]] = []
+        for scope, label in options:
+            if scope in seen:
+                continue
+            unique_options.append((scope, label))
+            seen.add(scope)
+        if default_scope not in seen:
+            default_scope = unique_options[0][0] if unique_options else ""
+        return unique_options, default_scope
+
+    def _run_search_from_dialog(
+        self,
+        *,
+        query: str,
+        scope: str,
+        case_sensitive: bool,
+        whole_word: bool,
+    ) -> None:
+        query = query.strip()
+        if not query:
+            self._clear_search_results()
             return
-        query = text.strip()
-        self._search_matches = []
-        content = self.content_editor.toPlainText()
-        idx = 0
-        while True:
-            idx = content.find(query, idx)
-            if idx == -1:
+        units = self._search_units_for_scope(scope)
+        matches: list[dict[str, Any]] = []
+        for unit in units:
+            text = str(unit.get("text", ""))
+            for start, end in _find_plain_text_matches(
+                text,
+                query,
+                case_sensitive=case_sensitive,
+                whole_word=whole_word,
+            ):
+                matches.append(
+                    {
+                        **unit,
+                        "start": start,
+                        "end": end,
+                        "snippet": _search_snippet(text, start, end),
+                    }
+                )
+                if len(matches) >= 500:
+                    break
+            if len(matches) >= 500:
                 break
-            self._search_matches.append((idx, idx + len(query)))
-            idx += 1
+        self._search_query = query
+        self._search_scope = scope
+        self._search_case_sensitive = case_sensitive
+        self._search_whole_word = whole_word
+        self._search_matches = matches
         if not self._search_matches:
-            info(self, "查找", f"未找到「{query}」。")
+            self._search_match_index = -1
+            if self.search_dialog:
+                self.search_dialog.set_results([], -1)
+            self._set_status(f"未找到「{query}」")
             return
         self._search_match_index = 0
-        self._search_query = query
-        self._highlight_search_match()
+        if self.search_dialog:
+            self.search_dialog.set_results(self._search_matches, self._search_match_index)
+        self._activate_search_result(self._search_match_index)
+
+    def _clear_search_results(self) -> None:
+        self._search_matches = []
+        self._search_match_index = -1
+        self._search_query = ""
+        self._search_scope = ""
+        self._search_case_sensitive = False
+        self._search_whole_word = False
+        if self.search_dialog:
+            self.search_dialog.set_results([], -1)
+
+    def _search_units_for_scope(self, scope: str) -> list[dict[str, Any]]:
+        book_id = self.state.selected_book_id
+        if not book_id:
+            return []
+        units: list[dict[str, Any]] = []
+        if scope == "book":
+            book = self.database.get_book(book_id)
+            if book:
+                book_outline = self.outline_editor.toPlainText() if self.state.editor_scope_kind == "book" else str(book["outline_text"] or "")
+                self._append_search_unit(
+                    units,
+                    title=f"{book['title']} / 书籍大纲",
+                    field="outline",
+                    field_label="书籍大纲",
+                    text=book_outline,
+                    node_key=("book", book_id, None),
+                )
+            for volume in self.database.list_volumes(book_id):
+                volume_data = row_to_dict(volume)
+                self._append_search_unit(
+                    units,
+                    title=f"{volume_data.get('title', '')} / 卷大纲",
+                    field="outline",
+                    field_label="卷大纲",
+                    text=str(volume_data.get("outline_text", "") or ""),
+                    node_key=("volume", int(volume_data["id"]), None),
+                )
+            chapters = self.database.list_chapters(book_id)
+        elif scope == "volume":
+            volume_filter: int | str
+            if self.state.selected_volume_id:
+                volume_filter = self.state.selected_volume_id
+                volume = self.database.get_volume(self.state.selected_volume_id)
+                if volume:
+                    volume_outline = self.outline_editor.toPlainText() if self.state.editor_scope_kind == "volume" else str(volume["outline_text"] or "")
+                    self._append_search_unit(
+                        units,
+                        title=f"{volume['title']} / 卷大纲",
+                        field="outline",
+                        field_label="卷大纲",
+                        text=volume_outline,
+                        node_key=("volume", self.state.selected_volume_id, None),
+                    )
+            else:
+                volume_filter = UNASSIGNED_VOLUMES
+            chapters = self.database.list_chapters(book_id, volume_filter)
+        elif scope == "chapter" and self.state.selected_chapter_id:
+            chapter = self.database.get_chapter(self.state.selected_chapter_id)
+            chapters = [chapter] if chapter else []
+        else:
+            chapters = []
+
+        for chapter_row in chapters:
+            if not chapter_row:
+                continue
+            chapter_summary = row_to_dict(chapter_row)
+            detail = self.database.get_chapter(int(chapter_summary["id"]))
+            if not detail:
+                continue
+            self._append_chapter_search_units(units, row_to_dict(detail))
+        return units
+
+    def _append_chapter_search_units(self, units: list[dict[str, Any]], chapter: dict[str, Any]) -> None:
+        chapter_id = int(chapter["id"])
+        title = str(chapter.get("title", "") or "")
+        outline = str(chapter.get("outline", "") or "")
+        content = str(chapter.get("content", "") or "")
+        summary = str(chapter.get("summary_text", "") or "")
+        if self.state.editor_scope_kind == "chapter" and self.state.editor_scope_id == chapter_id:
+            outline = self.chapter_outline_editor.toPlainText()
+            content = self.content_editor.toPlainText()
+            summary = self.loaded_chapter_summary_text
+        node_key = ("chapter", chapter_id, None)
+        volume_title = str(chapter.get("volume_title", "") or "未分卷")
+        base_title = f"{volume_title} / {title}"
+        self._append_search_unit(units, title=base_title, field="title", field_label="标题", text=title, node_key=node_key)
+        self._append_search_unit(units, title=base_title, field="outline", field_label="章节大纲", text=outline, node_key=node_key)
+        self._append_search_unit(units, title=base_title, field="summary", field_label="章节摘要", text=summary, node_key=node_key)
+        self._append_search_unit(units, title=base_title, field="content", field_label="正文", text=content, node_key=node_key)
+
+    def _append_search_unit(
+        self,
+        units: list[dict[str, Any]],
+        *,
+        title: str,
+        field: str,
+        field_label: str,
+        text: str,
+        node_key: tuple[str, int | None, int | None],
+    ) -> None:
+        if not str(text or "").strip():
+            return
+        units.append(
+            {
+                "title": title,
+                "field": field,
+                "field_label": field_label,
+                "text": str(text),
+                "node_key": node_key,
+            }
+        )
 
     def _highlight_search_match(self) -> None:
+        if not self._search_matches or self._search_match_index < 0:
+            return
+        self._activate_search_result(self._search_match_index)
+
+    def _search_next_match(self) -> None:
         if not self._search_matches:
             return
-        idx = self._search_match_index % len(self._search_matches)
-        start, end = self._search_matches[idx]
-        cursor = self.content_editor.textCursor()
+        self._activate_search_result((self._search_match_index + 1) % len(self._search_matches))
+
+    def _search_previous_match(self) -> None:
+        if not self._search_matches:
+            return
+        self._activate_search_result((self._search_match_index - 1) % len(self._search_matches))
+
+    def _activate_search_result(self, index: int) -> None:
+        if not self._search_matches:
+            return
+        index = index % len(self._search_matches)
+        result = self._search_matches[index]
+        node_key = result.get("node_key")
+        if not isinstance(node_key, tuple) or len(node_key) != 3:
+            return
+        if self.current_tree_key != node_key:
+            if not self._confirm_editor_navigation() or not self._confirm_side_form_navigation():
+                return
+            self._activate_tree_key(node_key)
+            self._select_tree_key(node_key)
+        self._search_match_index = index
+        field = str(result.get("field", ""))
+        start = int(result.get("start", 0) or 0)
+        end = int(result.get("end", start) or start)
+        editor: QPlainTextEdit | None = None
+        if field == "content" and self.state.editor_scope_kind == "chapter":
+            editor = self.content_editor
+        elif field == "outline":
+            if self.state.editor_scope_kind == "chapter":
+                editor = self.chapter_outline_editor
+            elif self.state.editor_scope_kind in {"book", "volume"}:
+                editor = self.outline_editor
+        if editor is not None:
+            self._select_search_text(editor, start, end)
+        if self.search_dialog:
+            self.search_dialog.set_results(self._search_matches, self._search_match_index)
+        self._set_status(f"匹配 {self._search_match_index + 1}/{len(self._search_matches)} · {result.get('field_label', '')}")
+
+    def _select_search_text(self, editor: QPlainTextEdit, start: int, end: int) -> None:
+        text_length = len(editor.toPlainText())
+        start = max(0, min(start, text_length))
+        end = max(start, min(end, text_length))
+        cursor = editor.textCursor()
         cursor.setPosition(start)
         cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
-        self.content_editor.setTextCursor(cursor)
-        self.content_editor.ensureCursorVisible()
-        self._set_status(f"匹配 {idx + 1}/{len(self._search_matches)}")
+        editor.setTextCursor(cursor)
+        editor.setFocus()
+        editor.ensureCursorVisible()
 
     def keyPressEvent(self, event) -> None:
         if event.key() == Qt.Key.Key_F3 and self._search_matches and hasattr(self, "_search_match_index"):
-            self._search_match_index += 1
-            self._highlight_search_match()
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                self._search_previous_match()
+            else:
+                self._search_next_match()
             return
         if event.key() == Qt.Key.Key_F and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             self._show_search_bar()
@@ -2703,28 +3477,27 @@ class NovelQtMainWindow(QMainWindow):
         if not content.strip():
             info(self, "纠错", "当前章节正文为空。")
             return
-        findings = detect_chinese_typos(content)
-        if self.correction_ai_enabled:
-            ai_service = self._ai_service_for_purpose("detector")
-            if ai_service is None:
-                self._show_correction_findings(content, findings, "AI 纠错检测未配置，已仅使用本地纠错。")
-                return
-            if self._find_active_background_job("AI 纠错"):
-                info(self, "任务运行中", "AI 纠错已经在运行。")
-                return
-
-            def work() -> list[dict[str, Any]]:
-                return ai_service.detect_chinese_typos(content, require_remote=True)
-
-            def done(payload: Any) -> None:
-                ai_findings = payload if isinstance(payload, list) else []
-                merged = self._merge_correction_findings(findings, ai_findings)
-                self._show_correction_findings(content, merged, f"AI 纠错完成：本地 {len(findings)} 处，AI {len(ai_findings)} 处。")
-
-            self._show_correction_findings(content, findings, f"本地纠错完成：{len(findings)} 处；AI 纠错检测中。")
-            self._run_background_ai_job(label="AI 纠错", callback=work, on_done=done)
+        ai_service = self._require_ai_service("correction", "AI 纠错")
+        if ai_service is None:
             return
-        self._show_correction_findings(content, findings)
+        if self._find_active_background_job("AI 纠错"):
+            info(self, "任务运行中", "AI 纠错已经在运行。")
+            return
+
+        def work() -> list[dict[str, Any]]:
+            return ai_service.detect_chinese_typos(content, require_remote=True)
+
+        def done(payload: Any) -> None:
+            if self.content_editor.toPlainText() != content:
+                self._clear_correction_highlights()
+                info(self, "纠错", "章节内容已变化，本次 AI 纠错结果已丢弃。请重新运行纠错。")
+                return
+            findings = payload if isinstance(payload, list) else []
+            self._show_correction_findings(content, findings, f"AI 纠错完成：{len(findings)} 处。")
+
+        self._clear_correction_highlights()
+        self._set_status("AI 纠错校对中。")
+        self._run_background_ai_job(label="AI 纠错", callback=work, on_done=done)
 
     def _show_correction_findings(self, content: str, findings: list[dict[str, Any]], status_message: str = "") -> None:
         if not findings:
@@ -2733,32 +3506,6 @@ class NovelQtMainWindow(QMainWindow):
             return
         self._apply_correction_highlights(content, findings)
         self._set_status(status_message or f"纠错完成：{len(findings)} 处疑似错别字已高亮")
-
-    def _merge_correction_findings(
-        self,
-        local_findings: list[dict[str, Any]],
-        ai_findings: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        merged: list[dict[str, Any]] = []
-        occupied: list[tuple[int, int]] = []
-        for item in [*local_findings, *ai_findings]:
-            try:
-                start = int(item.get("start", 0))
-                end = int(item.get("end", start))
-            except (TypeError, ValueError, AttributeError):
-                continue
-            if end <= start:
-                continue
-            if any(start < old_end and end > old_start for old_start, old_end in occupied):
-                continue
-            normalized = dict(item)
-            normalized.setdefault("severity", "low")
-            normalized.setdefault("wrong", "")
-            normalized.setdefault("suggestion", "")
-            merged.append(normalized)
-            occupied.append((start, end))
-        merged.sort(key=lambda item: int(item.get("start", 0)))
-        return merged
 
     def _apply_correction_highlights(self, content: str, findings: list[dict[str, Any]]) -> None:
         if not hasattr(self, "content_editor"):
@@ -2985,7 +3732,7 @@ class NovelQtMainWindow(QMainWindow):
                 self.editor_title.setText(f"● {current}")
             elif not dirty and current.startswith("● "):
                 self.editor_title.setText(current[2:])
-        base_title = "Simple AI Novel App - PyQt6 Workbench"
+        base_title = APP_DISPLAY_NAME
         if hasattr(self, "state") and dirty:
             self.setWindowTitle(f"* {base_title}")
         else:
@@ -2998,7 +3745,18 @@ class NovelQtMainWindow(QMainWindow):
             return True
         try:
             if kind == "book":
-                self.database.update_book_outline(scope_id, self.outline_editor.toPlainText())
+                outline_data = self.book_outline_form.to_data(self.state.selected_book_title)
+                volume_specs = self._book_outline_volume_specs(int(scope_id))
+                outline = book_outline_form_to_markdown(outline_data, self.state.selected_book_title, volume_specs)
+                self.database.update_book_outline(scope_id, outline, outline_data=outline_data)
+                self.outline_editor.blockSignals(True)
+                try:
+                    self.outline_editor.setPlainText(outline)
+                finally:
+                    self.outline_editor.blockSignals(False)
+                self._refresh_outline_markdown_preview()
+                self._sync_truth_files(int(scope_id))
+                self._index_book_design_for_rag(int(scope_id))
             elif kind == "volume":
                 self.database.update_volume_outline(scope_id, self.outline_editor.toPlainText())
             elif kind == "chapter":
@@ -3295,7 +4053,13 @@ class NovelQtMainWindow(QMainWindow):
         book_id: int | None = None
         try:
             book_id = self.database.create_book(parsed.title)
-            self.database.update_book_outline(book_id, parsed.outline)
+            outline_data = merge_book_outline_supplement(
+                self.database.get_book_outline_form(book_id),
+                parsed.title,
+                parsed.outline,
+                supplement_title="导入补充",
+            )
+            self.database.update_book_outline_form(book_id, outline_data)
 
             volume_ids: dict[str, int] = {}
             volume_chapters: dict[str, list[Any]] = {}
@@ -3322,6 +4086,8 @@ class NovelQtMainWindow(QMainWindow):
             for volume_title, volume_id in volume_ids.items():
                 outline = self._build_imported_volume_outline(volume_title, volume_chapters.get(volume_title, []))
                 self.database.update_volume_outline(volume_id, outline)
+            self._sync_truth_files(book_id)
+            self._index_book_design_for_rag(book_id)
             return book_id, first_chapter_id
         except Exception:
             if book_id is not None:
@@ -3358,8 +4124,14 @@ class NovelQtMainWindow(QMainWindow):
             if first_chapter_id is None:
                 first_chapter_id = chapter_id
 
-        merged_book_outline = self._merge_imported_outline(str(book["outline_text"] or ""), parsed.outline)
-        self.database.update_book_outline(book_id, merged_book_outline)
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        outline_data = merge_book_outline_supplement(
+            self.database.get_book_outline_form(book_id),
+            str(book["title"] or ""),
+            parsed.outline,
+            supplement_title=f"导入补充 · {stamp}",
+        )
+        self.database.update_book_outline_form(book_id, outline_data)
         for volume_title, volume_id in touched_volume_ids.items():
             volume = self.database.get_volume(volume_id)
             if not volume:
@@ -3367,6 +4139,8 @@ class NovelQtMainWindow(QMainWindow):
             imported_outline = self._build_imported_volume_outline(volume_title, volume_chapters.get(volume_title, []))
             merged_volume_outline = self._merge_imported_outline(str(volume["outline_text"] or ""), imported_outline)
             self.database.update_volume_outline(volume_id, merged_volume_outline)
+        self._sync_truth_files(book_id)
+        self._index_book_design_for_rag(book_id)
         return first_chapter_id
 
     def _merge_imported_outline(self, existing: str, imported: str) -> str:
@@ -3414,37 +4188,43 @@ class NovelQtMainWindow(QMainWindow):
             info(self, "智能导入", "文件内容为空。")
             return
 
-        local_doc_type = self._guess_smart_import_type(raw_text)
-        if local_doc_type:
-            self._open_drawer("tasks")
-            self._append_task_log(f"本地结构预检识别为 {local_doc_type}，跳过远程分类。")
-            self._dispatch_smart_import(local_doc_type, raw_text, source_path.stem)
-            return
-
         ai_service = self._ai_service_for_purpose("import")
         if ai_service is None:
-            fallback_type = self._fallback_smart_import_type(raw_text)
-            self._open_drawer("tasks")
-            self._append_task_log(f"未配置智能导入分类接口，按 {fallback_type} 本地导入。")
-            self._dispatch_smart_import(fallback_type, raw_text, source_path.stem)
+            info(self, "智能导入", "智能导入需要远程模型识别文档类型和章节结构。请先在 AI 设置中配置“智能导入分类”。")
             return
         self._open_drawer("tasks")
 
-        def work() -> str:
-            return ai_service.analyze_document(raw_text[:3000], require_remote=True)
+        def work() -> dict[str, Any]:
+            doc_type = ai_service.analyze_document(raw_text[:3000], require_remote=True)
+            normalized_type = str(doc_type).strip().lower()
+            chapter_structure: list[dict[str, Any]] = []
+            if normalized_type == "body":
+                chapter_structure = ai_service.detect_chapter_structure(raw_text, require_remote=True)
+            return {"doc_type": normalized_type, "chapter_structure": chapter_structure}
 
-        def done(doc_type: Any) -> None:
-            self._dispatch_smart_import(str(doc_type).strip().lower(), raw_text, source_path.stem)
+        def done(result: Any) -> None:
+            if isinstance(result, dict):
+                doc_type = str(result.get("doc_type", "body")).strip().lower()
+                chapter_structure = result.get("chapter_structure", [])
+            else:
+                doc_type = str(result).strip().lower()
+                chapter_structure = []
+            self._dispatch_smart_import(doc_type, raw_text, source_path.stem, chapter_structure)
 
         def failed(message: str) -> None:
-            fallback_type = self._fallback_smart_import_type(raw_text)
-            self._append_task_log(f"智能导入分类失败，按 {fallback_type} 本地导入。")
-            self._dispatch_smart_import(fallback_type, raw_text, source_path.stem)
-            self._set_status("智能导入分类失败，已使用本地导入策略")
+            self._append_task_log(f"智能导入失败：{message}")
+            self._set_status("智能导入失败，请检查远程模型配置")
+            error(self, "智能导入失败", f"远程模型未能完成文档分类或章节结构识别：\n{message}")
 
         self._run_background_ai_job(label="智能导入分类", callback=work, on_done=done, on_error=failed)
 
-    def _dispatch_smart_import(self, doc_type: str, raw_text: str, default_title: str) -> None:
+    def _dispatch_smart_import(
+        self,
+        doc_type: str,
+        raw_text: str,
+        default_title: str,
+        chapter_structure: list[dict[str, Any]] | None = None,
+    ) -> None:
         doc_type = doc_type if doc_type in {"body", "outline", "character", "world"} else "body"
         if doc_type == "outline":
             self._smart_import_outline(raw_text, default_title)
@@ -3453,54 +4233,26 @@ class NovelQtMainWindow(QMainWindow):
         elif doc_type == "world":
             self._smart_import_world(raw_text, default_title)
         else:
-            self._smart_import_body(raw_text, default_title)
+            self._smart_import_body(raw_text, default_title, chapter_structure)
 
-    def _guess_smart_import_type(self, raw_text: str) -> str | None:
-        text = raw_text.strip()
-        if not text:
-            return None
-        try:
-            parsed = parse_long_text("导入预检", text)
-        except Exception:
-            parsed = ParsedBook(title="", outline="", chapters=[])
-        total_body_chars = sum(len(chapter.content.strip()) for chapter in parsed.chapters)
-        heading_markers = len(re.findall(r"第\s*[\d零〇一二两三四五六七八九十百千万]+\s*[章节回幕]|[|｜]\s*[\d零〇一二两三四五六七八九十百千万]+\s*[|｜]", text))
-        if len(parsed.chapters) >= 2 and total_body_chars >= 600:
-            return "body"
-        if len(parsed.chapters) == 1 and total_body_chars >= 1800:
-            return "body"
-        if heading_markers >= 2 and total_body_chars >= 600:
-            return "body"
-        compact = re.sub(r"\s+", "", text)
-        if len(compact) <= 2000 and any(word in compact for word in ("人物设定", "角色介绍", "姓名", "性格", "外貌")):
-            return "character"
-        if len(compact) <= 2400 and any(word in compact for word in ("世界观", "势力", "地理", "种族", "魔法体系", "规则设定")):
-            return "world"
-        if len(compact) <= 4000 and any(word in compact for word in ("大纲", "目录", "章节结构", "剧情梗概")):
-            return "outline"
-        return None
-
-    def _fallback_smart_import_type(self, raw_text: str) -> str:
-        guessed = self._guess_smart_import_type(raw_text)
-        if guessed:
-            return guessed
-        compact = re.sub(r"\s+", "", raw_text or "")
-        if len(compact) >= 1200:
-            return "body"
-        if any(word in compact for word in ("人物", "角色", "姓名", "性格", "外貌")):
-            return "character"
-        if any(word in compact for word in ("世界观", "势力", "地理", "种族", "规则")):
-            return "world"
-        return "outline"
-
-    def _smart_import_body(self, raw_text: str, default_title: str) -> None:
+    def _smart_import_body(
+        self,
+        raw_text: str,
+        default_title: str,
+        chapter_structure: list[dict[str, Any]] | None = None,
+    ) -> None:
         if not self._confirm_editor_navigation():
             return
         title = ask_text(self, "智能导入 — 正文", "请输入导入后的书名：", default_title)
         if not title:
             return
         try:
-            parsed = parse_long_text(title, raw_text)
+            parsed = parse_long_text(
+                title,
+                raw_text,
+                chapter_structure=chapter_structure,
+                use_local_headings=False,
+            )
         except Exception as exc:
             error(self, "智能导入失败", f"文本拆分失败：\n{exc}")
             return
@@ -3535,6 +4287,16 @@ class NovelQtMainWindow(QMainWindow):
             return
         if self.state.editor_scope_kind == "chapter":
             self.chapter_outline_editor.setPlainText(raw_text.strip())
+        elif self.state.editor_scope_kind == "book":
+            volume_specs = self._book_outline_volume_specs(self.state.selected_book_id)
+            data = merge_book_outline_supplement(
+                self.book_outline_form.to_data(self.state.selected_book_title),
+                self.state.selected_book_title,
+                raw_text,
+                supplement_title=f"导入补充 · {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+            )
+            self.book_outline_form.set_data(data, self.state.selected_book_title, volume_specs)
+            self._on_book_outline_form_changed()
         else:
             self.outline_editor.setPlainText(raw_text.strip())
         self.state.editor_dirty = True
@@ -3545,11 +4307,23 @@ class NovelQtMainWindow(QMainWindow):
         if not self.state.selected_book_id:
             info(self, "智能导入", "请先选择一本书以创建人物。")
             return
+        if not self._confirm_character_edit_navigation():
+            return
         name = ask_text(self, "智能导入 — 人物", "请输入人物名称：", default_name)
         if not name:
             return
         char_id = self.database.create_character(self.state.selected_book_id, name)
-        self.database.update_character(char_id, name, "", raw_text.strip())
+        profile_data = merge_character_profile_supplement(
+            self.database.get_character_profile_form(char_id),
+            name,
+            "",
+            raw_text.strip(),
+            supplement_title=f"智能导入补充 · {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        )
+        self.database.update_character_form(char_id, name, "", profile_data)
+        self.selected_character_id = char_id
+        self._sync_truth_files(self.state.selected_book_id)
+        self._index_book_design_for_rag(self.state.selected_book_id)
         self._refresh_drawer()
         self._open_drawer("details")
         self._set_drawer_tab("characters")
@@ -3558,24 +4332,41 @@ class NovelQtMainWindow(QMainWindow):
 
     def _smart_import_world(self, raw_text: str, default_name: str) -> None:
         if not self.state.selected_book_id:
-            info(self, "智能导入", "请先选择一本书以创建世界观条目。")
+            info(self, "智能导入", "请先选择一本书以导入世界观。")
             return
-        name = ask_text(self, "智能导入 — 世界观", "请输入条目名称：", default_name)
-        if not name:
-            return
-        entry_id = self.database.create_world_entry(self.state.selected_book_id, name)
-        self.database.update_world_entry(entry_id, name, "设定", raw_text.strip())
+        base_data = (
+            self.world_form.to_data()
+            if hasattr(self, "world_form") and getattr(self, "_world_form_book_id", None) == self.state.selected_book_id
+            else self.database.get_book_world_form(self.state.selected_book_id)
+        )
+        world_data = merge_world_supplement(
+            base_data,
+            raw_text,
+            supplement_title=f"智能导入补充 · {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        )
+        self.database.update_book_world_form(self.state.selected_book_id, world_data)
+        self._sync_truth_files(self.state.selected_book_id)
+        self._index_book_design_for_rag(self.state.selected_book_id)
+        if hasattr(self, "world_form"):
+            self.world_form.set_data(world_data)
+            self._world_form_book_id = self.state.selected_book_id
+            self._refresh_world_markdown_preview()
+            self._world_form_dirty = False
+        else:
+            self._load_world_form_for_book(self.state.selected_book_id)
         self._refresh_drawer()
         self._open_drawer("details")
         self._set_drawer_tab("world")
-        self._set_status(f"世界观条目「{name}」已创建并导入。")
-        info(self, "导入完成", f"世界观条目「{name}」已创建。请在详情抽屉中核对内容。")
+        self._set_status("世界观内容已导入统一模板。")
+        info(self, "导入完成", "世界观内容已加入统一模板补充区。请在详情抽屉中核对内容。")
 
     def _create_book(self) -> None:
         title = ask_text(self, "新建书籍", "请输入书名：")
         if not title:
             return
         book_id = self.database.create_book(title)
+        self._sync_truth_files(book_id)
+        self._index_book_design_for_rag(book_id)
         key = ("book", book_id, None)
         self._load_library_tree(key)
         self._activate_tree_key(key)
@@ -3621,6 +4412,8 @@ class NovelQtMainWindow(QMainWindow):
         if not title:
             return
         volume_id = self.database.create_volume(book_id, title)
+        self._sync_truth_files(book_id)
+        self._index_book_design_for_rag(book_id)
         key = ("volume", volume_id, None)
         self._load_library_tree(key)
         self._activate_tree_key(key)
@@ -3632,7 +4425,10 @@ class NovelQtMainWindow(QMainWindow):
         title = ask_text(self, "重命名卷", "请输入新卷名：", str(volume["title"]))
         if not title:
             return
+        book_id = int(volume["book_id"])
         self.database.rename_volume(volume_id, title)
+        self._sync_truth_files(book_id)
+        self._index_book_design_for_rag(book_id)
         key = ("volume", volume_id, None)
         self._load_library_tree(key)
         self._activate_tree_key(key)
@@ -3643,13 +4439,21 @@ class NovelQtMainWindow(QMainWindow):
             return
         if not confirm(self, "删除卷", f"确定删除卷《{volume['title']}》吗？章节会移入未分卷。", danger=True):
             return
+        book_id = int(volume["book_id"])
         self.database.delete_volume(volume_id)
-        key = ("book", int(volume["book_id"]), None)
+        self._sync_truth_files(book_id)
+        self._index_book_design_for_rag(book_id)
+        key = ("book", book_id, None)
         self._load_library_tree(key)
         self._activate_tree_key(key)
 
     def _move_volume(self, volume_id: int, direction: int) -> None:
+        volume = self.database.get_volume(volume_id)
+        book_id = int(volume["book_id"]) if volume else None
         if self.database.move_volume(volume_id, direction):
+            if book_id:
+                self._sync_truth_files(book_id)
+                self._index_book_design_for_rag(book_id)
             key = ("volume", volume_id, None)
             self._load_library_tree(key)
             self._activate_tree_key(key)
@@ -3686,8 +4490,9 @@ class NovelQtMainWindow(QMainWindow):
         if not confirm(self, "删除章节", f"确定删除章节《{chapter['title']}》吗？", danger=True):
             return
         book_id = int(chapter["book_id"])
+        volume_id = chapter["volume_id"]
+        key = ("group", None, book_id) if volume_id is None else ("volume", int(volume_id), None)
         self.database.delete_chapter(chapter_id)
-        key = ("book", book_id, None)
         self._load_library_tree(key)
         self._activate_tree_key(key)
 
@@ -3737,141 +4542,28 @@ class NovelQtMainWindow(QMainWindow):
         self._set_status("章节已移动到目标卷")
 
     def _refresh_drawer(self) -> None:
-        book_id = self.state.selected_book_id
-        if not book_id:
-            self.global_skills = [dict(item) for item in self.database.list_bound_skills_for_global()]
-            self.book_skills = []
-            self.bound_skills = []
-            self.characters = []
-            self.world_entries = []
-            if hasattr(self, "overview_title"):
-                self.overview_title.setText("未选择书籍")
-                self.overview_meta.setText("卷 0 · 章节 0 · Skills 0")
-                self.sourcebook_preview.clear()
-            if hasattr(self, "characters_list"):
-                self.characters_list.clear()
-                self._clear_character_form()
-            if hasattr(self, "world_list"):
-                self.world_list.clear()
-                self._clear_world_form()
-            if hasattr(self, "enabled_skills_list"):
-                self.enabled_skills_list.clear()
-                self.skill_preview.clear()
-            self._sync_star_tab_visibility()
-            self._sync_overview_tab_visibility()
-            return
-        self._load_book_side_data(book_id)
-        self._sync_star_tab_visibility()
-        self._sync_overview_tab_visibility()
-        self._sync_shortcuts_tab_visibility()
-        self._sync_outline_tab_for_level()
-        self._refresh_overview()
-        self._drawer_tabs_stale = {"outline", "characters", "star", "world", "skills", "shortcuts", "review", "tasks"}
-        self._refresh_visible_drawer_tab()
+        return self.drawer_controller.refresh()
 
     def _on_drawer_tab_changed(self) -> None:
-        self._sync_star_tab_visibility()
-        self._sync_overview_tab_visibility()
-        self._sync_shortcuts_tab_visibility()
-        self._sync_outline_tab_for_level()
-        self._update_drawer_title()
-        self._refresh_visible_drawer_tab()
+        return self.drawer_controller.on_tab_changed()
 
     def _refresh_visible_drawer_tab(self) -> None:
-        if not hasattr(self, "drawer_tabs"):
-            return
-        stale = getattr(self, "_drawer_tabs_stale", None)
-        if stale is None:
-            return
-        key_map = {v: k for k, v in self.drawer_tab_indexes.items()}
-        current_index = self.drawer_tabs.currentIndex()
-        key = key_map.get(current_index)
-        if key is None or key not in stale:
-            return
-        stale.discard(key)
-        if key == "outline":
-            self._refresh_generation_outline_context()
-        elif key == "characters":
-            self._refresh_characters()
-        elif key == "star":
-            self._refresh_star_graph()
-        elif key == "world":
-            self._refresh_world()
-        elif key == "skills":
-            self._refresh_skills()
-        elif key == "review":
-            self._refresh_review_tab()
-        elif key == "shortcuts":
-            self._refresh_shortcuts_list()
+        return self.drawer_controller.refresh_visible_tab()
 
     def _is_book_level_selected(self) -> bool:
-        return bool(self.state.selected_book_id and self.state.current_node_kind == "book")
-
-    def _sync_star_tab_visibility(self) -> None:
-        if not hasattr(self, "drawer_tabs"):
-            return
-        index = self.drawer_tab_indexes.get("star")
-        if index is None:
-            return
-        visible = self._is_book_level_selected()
-        self._set_tab_visible(index, visible, fallback_key="outline")
+        return self.drawer_controller.is_book_level_selected()
 
     def _sync_overview_tab_visibility(self) -> None:
-        if not hasattr(self, "drawer_tabs"):
-            return
-        index = self.drawer_tab_indexes.get("overview")
-        if index is None:
-            return
-        visible = self._is_book_level_selected()
-        self._set_tab_visible(index, visible, fallback_key="outline")
+        return self.drawer_controller.sync_overview_tab_visibility()
 
     def _sync_shortcuts_tab_visibility(self) -> None:
-        if not hasattr(self, "drawer_tabs"):
-            return
-        index = self.drawer_tab_indexes.get("shortcuts")
-        if index is None:
-            return
-        visible = self._is_book_level_selected()
-        self._set_tab_visible(index, visible, fallback_key="outline")
-        if visible and self.state.selected_book_id:
-            self._refresh_shortcuts_list()
+        return self.drawer_controller.sync_shortcuts_tab_visibility()
 
     def _sync_outline_tab_for_level(self) -> None:
-        if not hasattr(self, "outline_tab_title"):
-            return
-        kind = self.state.current_node_kind
-        if kind == "volume" and self.state.selected_volume_id:
-            self.outline_tab_title.setText("卷大纲")
-            self.outline_action_btn.setText("保存卷大纲")
-            self.outline_sync_btn.hide()
-            self.chapter_outline_editor.hide()
-            self.volume_outline_editor.show()
-            volume = self.database.get_volume(self.state.selected_volume_id)
-            if volume:
-                self.volume_outline_editor.blockSignals(True)
-                self.volume_outline_editor.setPlainText(str(volume["outline_text"] or ""))
-                self.volume_outline_editor.blockSignals(False)
-        elif kind == "chapter":
-            self.outline_tab_title.setText("章节生成大纲")
-            self.outline_action_btn.setText("长篇生成")
-            self.outline_sync_btn.show()
-            self.volume_outline_editor.hide()
-            self.chapter_outline_editor.show()
-        else:
-            self.outline_tab_title.setText("章节生成大纲")
-            self.outline_action_btn.setText("长篇生成")
-            self.outline_sync_btn.show()
-            self.volume_outline_editor.hide()
-            self.chapter_outline_editor.show()
+        return self.drawer_controller.sync_outline_tab_for_level()
 
     def _set_tab_visible(self, index: int, visible: bool, *, fallback_key: str = "outline") -> None:
-        if hasattr(self.drawer_tabs, "setTabVisible"):
-            self.drawer_tabs.setTabVisible(index, visible)
-        else:
-            self.drawer_tabs.setTabEnabled(index, visible)
-        if not visible and self.drawer_tabs.currentIndex() == index:
-            fallback = self.drawer_tab_indexes.get(fallback_key, 0)
-            self.drawer_tabs.setCurrentIndex(fallback)
+        return self.drawer_controller.set_tab_visible(index, visible, fallback_key=fallback_key)
 
     @staticmethod
     def _is_named_character_record(character: dict[str, Any]) -> bool:
@@ -3923,15 +4615,29 @@ class NovelQtMainWindow(QMainWindow):
         if not self.state.selected_book_id or not hasattr(self, "generation_book_outline_editor"):
             info(self, "提示", "请先选择一本书。")
             return
-        self.database.update_book_outline(self.state.selected_book_id, self.generation_book_outline_editor.toPlainText())
+        outline = coerce_book_outline_markdown(
+            self.generation_book_outline_editor.toPlainText(),
+            self.state.selected_book_title,
+        )
+        self.database.update_book_outline(self.state.selected_book_id, outline)
+        book = self.database.get_book(self.state.selected_book_id)
+        if book:
+            outline = str(book["outline_text"] or outline)
+        self._sync_truth_files(self.state.selected_book_id)
+        self._index_book_design_for_rag(self.state.selected_book_id)
         if self.state.editor_scope_kind == "book":
+            volume_specs = self._book_outline_volume_specs(self.state.selected_book_id)
+            outline_data = self.database.get_book_outline_form(self.state.selected_book_id)
             self.loading_editor = True
             try:
-                self.outline_editor.setPlainText(self.generation_book_outline_editor.toPlainText())
+                self.book_outline_form.set_data(outline_data, self.state.selected_book_title, volume_specs)
+                self.outline_editor.setPlainText(outline)
             finally:
                 self.loading_editor = False
+            self._refresh_outline_markdown_preview()
             self._sync_editor_text_lengths()
             self._mark_clean()
+        self.generation_book_outline_editor.setPlainText(outline)
         self._refresh_overview()
         self._set_status("书籍全局描述已保存。")
 
@@ -4135,44 +4841,31 @@ class NovelQtMainWindow(QMainWindow):
         self._refresh_shortcuts_list()
 
     def _refresh_overview(self) -> None:
-        if not self.state.selected_book_id:
-            return
-        volumes = self.database.list_volumes(self.state.selected_book_id)
-        chapters = self.database.list_chapters(self.state.selected_book_id)
-        self.overview_title.setText(self.state.selected_book_title or "未命名书籍")
-        self.overview_meta.setText(
-            f"卷 {len(volumes)} · 章节 {len(chapters)} · Skills 全局 {len(self.global_skills)} / 书籍 {len(self.book_skills)} / 章节 {len(self.bound_skills)}"
-        )
-        self.sourcebook_preview.setPlainText(self._build_sourcebook_context())
+        return drawer_pages.refresh_overview(self)
 
     def _refresh_characters(self) -> None:
-        selected_id = self.selected_character_id
-        form_dirty = bool(getattr(self, "_character_form_dirty", False))
-        target_item: QListWidgetItem | None = None
-        self.characters_list.blockSignals(True)
-        self.characters_list.clear()
-        for item in self.characters:
-            list_item = QListWidgetItem(f"{item.get('name', '')} · {item.get('role', '') or '未设定'}")
-            list_item.setData(Qt.ItemDataRole.UserRole, int(item["id"]))
-            self.characters_list.addItem(list_item)
-            if selected_id is not None and int(item["id"]) == selected_id:
-                target_item = list_item
-        if target_item is not None:
-            self.characters_list.setCurrentItem(target_item)
-        else:
-            self.characters_list.setCurrentItem(None)
-        self.characters_list.blockSignals(False)
-        if form_dirty and target_item is not None:
-            self.selected_character_id = selected_id
-            return
-        if target_item is not None and selected_id is not None:
-            self._load_character_form(selected_id)
-        else:
-            self._clear_character_form()
+        return drawer_pages.refresh_characters(self)
 
-    def _toggle_character_list_collapsed(self, collapsed: bool) -> None:
-        self.characters_list.setVisible(not collapsed)
-        self.character_list_toggle.setText("展开人物列表" if collapsed else "收起人物列表")
+    def _refresh_character_list(self) -> None:
+        return drawer_pages.refresh_character_list(self)
+
+    def _select_character_list_row(self, character_id: int | None) -> None:
+        return drawer_pages.select_character_list_row(self, character_id)
+
+    def _open_character_from_list_item(self, item: QListWidgetItem) -> None:
+        return drawer_pages.open_character_from_list_item(self, item)
+
+    def _open_character_detail_dialog(self, character_id: int) -> None:
+        return drawer_pages.open_character_detail_dialog(self, character_id)
+
+    def _refresh_character_picker_label(self) -> None:
+        return drawer_pages.refresh_character_picker_label(self)
+
+    def _show_character_picker_menu(self) -> None:
+        return drawer_pages.show_character_picker_menu(self)
+
+    def _select_character_from_picker(self, character_id: int) -> None:
+        return drawer_pages.select_character_from_picker(self, character_id)
 
     def _refresh_star_graph(self) -> None:
         if not hasattr(self, "star_graph") or not self.state.selected_book_id:
@@ -4241,13 +4934,9 @@ class NovelQtMainWindow(QMainWindow):
         self._refresh_star_graph()
 
     def _edit_character_from_graph(self, character_id: int) -> None:
-        self._open_drawer("details")
+        self._open_drawer("characters")
         self._set_drawer_tab("characters")
-        for index in range(self.characters_list.count()):
-            item = self.characters_list.item(index)
-            if int(item.data(Qt.ItemDataRole.UserRole)) == character_id:
-                self.characters_list.setCurrentItem(item)
-                break
+        self._select_character_from_picker(character_id)
 
     def _delete_character_from_graph(self, character_id: int) -> None:
         character = self.database.get_character(character_id)
@@ -4317,293 +5006,66 @@ class NovelQtMainWindow(QMainWindow):
         self._activate_tree_key(key)
 
     def _refresh_world(self) -> None:
-        selected_id = self.selected_world_entry_id
-        form_dirty = bool(getattr(self, "_world_form_dirty", False))
-        self._filter_world_list(restore_selection=(selected_id, form_dirty, selected_id))
-
-    def _filter_world_list(self, restore_selection: tuple | None = None) -> None:
-        if not hasattr(self, "world_search") or not hasattr(self, "world_list"):
-            return
-        query = self.world_search.text().strip().lower() if hasattr(self, "world_search") else ""
-        target_item: QListWidgetItem | None = None
-        selected_id = restore_selection[0] if restore_selection else self.selected_world_entry_id
-        form_dirty = restore_selection[1] if restore_selection else bool(getattr(self, "_world_form_dirty", False))
-        self.world_list.blockSignals(True)
-        self.world_list.clear()
-        for item in self.world_entries:
-            name = str(item.get("name", ""))
-            category = str(item.get("category", "") or "设定")
-            if query and query not in name.lower() and query not in category.lower():
-                continue
-            list_item = QListWidgetItem(f"{name} [{category}]")
-            list_item.setData(Qt.ItemDataRole.UserRole, int(item["id"]))
-            self.world_list.addItem(list_item)
-            if selected_id is not None and int(item["id"]) == selected_id:
-                target_item = list_item
-        if target_item is not None:
-            self.world_list.setCurrentItem(target_item)
-        else:
-            self.world_list.setCurrentItem(None)
-        self.world_list.blockSignals(False)
-        if form_dirty and target_item is not None:
-            self.selected_world_entry_id = selected_id
-            return
-        if target_item is not None and selected_id is not None:
-            self._load_world_form(selected_id)
-        else:
-            self._clear_world_form()
+        return drawer_pages.refresh_world(self)
 
     def _refresh_skills(self) -> None:
-        self.enabled_skills_list.clear()
-        scoped_items = [
-            ("全局", item) for item in self.global_skills
-        ] + [
-            ("书籍", item) for item in self.book_skills
-        ] + [
-            ("章节", item) for item in self.bound_skills
-        ]
-        seen: set[int] = set()
-        for scope_label, item in scoped_items:
-            skill_id = int(item["id"])
-            if skill_id in seen:
-                continue
-            seen.add(skill_id)
-            list_item = QListWidgetItem(f"{scope_label} · {item.get('name', '')} · {item.get('category', '')}")
-            list_item.setData(Qt.ItemDataRole.UserRole, item)
-            self.enabled_skills_list.addItem(list_item)
+        return drawer_pages.refresh_skills(self)
 
     def _on_enabled_skill_selected(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
-        if not current:
-            self.skill_preview.clear()
-            return
-        item = current.data(Qt.ItemDataRole.UserRole) or {}
-        self.skill_preview.setPlainText(
-            "\n".join(
-                [
-                    str(item.get("summary", "")),
-                    "",
-                    str(item.get("instruction_text", "")),
-                    "",
-                    f"来源：{item.get('source_title', '')}",
-                    f"许可：{item.get('source_license', '') or '未记录'}",
-                ]
-            ).strip()
-        )
+        return drawer_pages.on_enabled_skill_selected(self, current, _previous)
 
     def _refresh_review_tab(self) -> None:
-        if not hasattr(self, "review_runs_list"):
-            return
-        self.review_runs_list.blockSignals(True)
-        self.review_runs_list.clear()
-        self.selected_review_run_id = None
-        if not self.state.selected_book_id:
-            self.review_templates_label.clear()
-            self.review_detail.clear()
-            self.review_runs_list.blockSignals(False)
-            return
-        templates = self.database.list_template_chapters(self.state.selected_book_id)
-        if templates:
-            names = "、".join(str(item["title"]) for item in templates[:3])
-            self.review_templates_label.setText(f"对照模板：{names}")
-        else:
-            self.review_templates_label.setText("对照模板：未设置")
-        chapter_id = self.state.selected_chapter_id if self.state.current_node_kind == "chapter" else None
-        runs = self.database.list_review_runs(self.state.selected_book_id, chapter_id, limit=20)
-        for run in runs:
-            status = str(run["status"] or "unknown")
-            score = int(run["overall_score"] or 0)
-            verdict = str(run["final_verdict"] or "reject")
-            stamp = str(run["created_at"] or "")
-            chapter_label = f"章节 {run['chapter_id']}" if run["chapter_id"] is not None else str(run["scope_type"] or "book")
-            summary = str(run["summary"] or "").replace("\n", " ")[:80]
-            label = "\n".join(
-                [
-                    f"{status} / {verdict} / {score}分",
-                    summary or "无摘要",
-                    f"{stamp[:16]} · {chapter_label}",
-                ]
-            )
-            item = QListWidgetItem(label)
-            item.setData(Qt.ItemDataRole.UserRole, int(run["id"]))
-            item.setSizeHint(QSize(0, 62))
-            self.review_runs_list.addItem(item)
-        self.review_runs_list.blockSignals(False)
-        if self.review_runs_list.count():
-            self.review_runs_list.setCurrentRow(0)
-        else:
-            self.review_detail.setPlainText("暂无生成记录。")
+        return drawer_pages.refresh_review_tab(self)
 
     def _on_review_run_selected(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
-        if not current:
-            self.selected_review_run_id = None
-            if hasattr(self, "review_detail"):
-                self.review_detail.clear()
-            return
-        run_id = int(current.data(Qt.ItemDataRole.UserRole))
-        self.selected_review_run_id = run_id
-        self._render_review_run_detail(run_id)
+        return drawer_pages.on_review_run_selected(self, current, _previous)
 
     def _render_review_run_detail(self, run_id: int) -> None:
-        run_row = self.database.get_review_run(run_id)
-        if not run_row:
-            self.review_detail.setPlainText("生成记录不存在。")
-            return
-        run = dict(run_row)
-        findings = [dict(item) for item in self.database.list_review_findings(run_id)]
-        dimension_labels = {"character": "人物状态", "world": "世界观设定", "fact": "剧情事实"}
-        cross_findings = [f for f in findings if f.get("is_cross_chapter")]
-        single_findings = [f for f in findings if not f.get("is_cross_chapter")]
-        lines = [
-            f"状态：{run['status']}",
-            f"判定：{run['final_verdict']}",
-            f"分数：{run['overall_score']}",
-            f"章节 ID：{run['chapter_id'] or '无'}",
-            f"快照 ID：{run['snapshot_id'] or '无'}",
-            f"创建：{run['created_at']}",
-            f"应用：{run['applied_at'] or '未覆盖'}",
-            "",
-            "摘要：",
-            str(run["summary"] or "无"),
-            "",
-        ]
-        cross_summary = str(run.get("cross_summary") or "").strip()
-        if cross_summary:
-            lines.extend(["【跨章节一致性】", cross_summary, ""])
-        lines.extend([
-            "风险提示：",
-            str(run["risk_notes"] or "无"),
-            "",
-            "模板对比：",
-            str(run["template_comparison"] or "无"),
-            "",
-            "本章节问题：",
-        ])
-        if single_findings:
-            for index, item in enumerate(single_findings, start=1):
-                lines.extend(
-                    [
-                        f"{index}. [{item['severity']}] {item['agent']} / {item['category']} / {item['location_hint']}",
-                        f"问题：{item['issue_text']}",
-                        f"建议：{item['suggestion_text']}",
-                        f"引用：{item['quote_text'] or '无'}",
-                        "",
-                    ]
-                )
-        else:
-            lines.append("无")
-        if cross_findings:
-            lines.extend(["", "【跨章节一致性问题】"])
-            for index, item in enumerate(cross_findings, start=1):
-                dimension = dimension_labels.get(str(item.get("dimension", "")), str(item.get("dimension", "")))
-                conflict_with = str(item.get("conflict_with", "")).strip() or "前序章节"
-                lines.extend(
-                    [
-                        f"{index}. [{item['severity']}] {dimension} / 与 {conflict_with} 冲突",
-                        f"问题：{item['issue_text']}",
-                        f"建议：{item['suggestion_text']}",
-                        "",
-                    ]
-                )
-        self.review_detail.setPlainText("\n".join(lines).strip())
+        return drawer_pages.render_review_run_detail(self, run_id)
 
     def _selected_review_run(self) -> dict[str, Any] | None:
-        if not self.selected_review_run_id:
-            return None
-        run = self.database.get_review_run(self.selected_review_run_id)
-        return dict(run) if run else None
+        return drawer_pages.selected_review_run(self)
 
     def _view_selected_review_snapshot(self) -> None:
-        run = self._selected_review_run()
-        if not run or not run.get("snapshot_id"):
-            info(self, "生成快照", "当前生成记录没有关联快照。")
-            return
-        snapshot = self.database.get_snapshot(int(run["snapshot_id"]))
-        if not snapshot:
-            info(self, "审查快照", "快照不存在或已被删除。")
-            return
-        self.review_detail.setPlainText(
-            "\n".join(
-                [
-                    f"快照：{snapshot['label']}",
-                    f"创建：{snapshot['created_at']}",
-                    "",
-                    "大纲：",
-                    str(snapshot["outline"] or ""),
-                    "",
-                    "正文：",
-                    str(snapshot["content"] or ""),
-                ]
-            )
-        )
+        return drawer_pages.view_selected_review_snapshot(self)
 
     def _restore_selected_review_snapshot(self) -> None:
-        run = self._selected_review_run()
-        if not run or not run.get("snapshot_id"):
-            info(self, "恢复快照", "当前生成记录没有关联快照。")
-            return
-        snapshot = self.database.get_snapshot(int(run["snapshot_id"]))
-        if not snapshot:
-            info(self, "恢复快照", "快照不存在或已被删除。")
-            return
-        chapter_id = int(snapshot["chapter_id"])
-        if not confirm(self, "恢复审查前快照", "确定用审查前快照覆盖当前章节吗？", danger=True):
-            return
-        self.database.update_chapter(
-            chapter_id,
-            outline=str(snapshot["outline"] or ""),
-            content=str(snapshot["content"] or ""),
-            summary_text="",
-        )
-        self.database.delete_chapter_ai_spans(chapter_id)
-        self.database.update_chapter_ai_probability(chapter_id, 0, "none")
-        if self.state.selected_chapter_id == chapter_id:
-            self._load_chapter(chapter_id)
-        else:
-            self._load_library_tree(self.current_tree_key)
-        self._refresh_review_tab()
-        self._set_status("已恢复审查前快照")
+        return drawer_pages.restore_selected_review_snapshot(self)
 
     def _copy_selected_review_truth_file(self) -> None:
-        run = self._selected_review_run()
-        if not run:
-            return
-        truth = str(run.get("truth_snapshot", "") or "")
-        if not truth:
-            info(self, "Truth File", "当前生成记录没有 Truth File。")
-            return
-        QApplication.clipboard().setText(truth)
-        self._set_status("Truth File 已复制")
-
-    def _on_character_selected(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
-        if not self._confirm_character_edit_navigation():
-            if _previous:
-                self.characters_list.setCurrentItem(_previous)
-            return
-        if not current:
-            self._clear_character_form()
-            return
-        character_id = int(current.data(Qt.ItemDataRole.UserRole))
-        self._load_character_form(character_id)
+        return drawer_pages.copy_selected_review_truth_file(self)
 
     def _load_character_form(self, character_id: int) -> None:
+        self._ensure_character_detail_dialog()
         detail = self.database.get_character(character_id)
         if not detail:
             return
+        name = str(detail["name"])
+        role = str(detail["role"] or "")
+        profile_data = self.database.get_character_profile_form(character_id)
         self.selected_character_id = character_id
-        self.character_name.setText(str(detail["name"]))
-        self.character_role.setText(str(detail["role"] or ""))
-        self.character_profile.setPlainText(str(detail["profile_text"] or ""))
+        self.loading_editor = True
+        self.character_name.setText(name)
+        self.character_role.setText(role)
+        self.character_profile_form.set_data(profile_data, name, role)
+        self.loading_editor = False
         self.character_image_path = str(detail["image_path"] or "")
         self._refresh_character_image_preview()
+        self._refresh_character_markdown_preview()
+        self._refresh_character_picker_label()
         self._character_form_dirty = False
 
     def _clear_character_form(self) -> None:
+        self._ensure_character_detail_dialog()
         self.selected_character_id = None
         self.character_name.clear()
         self.character_role.clear()
-        self.character_profile.clear()
+        if hasattr(self, "character_profile_form"):
+            self.character_profile_form.set_data(character_profile_form_defaults("", ""), "", "")
         self.character_image_path = ""
         self._refresh_character_image_preview()
+        self._refresh_character_markdown_preview()
+        self._refresh_character_picker_label()
         self._character_form_dirty = False
 
     def _confirm_character_edit_navigation(self) -> bool:
@@ -4620,6 +5082,8 @@ class NovelQtMainWindow(QMainWindow):
         return True
 
     def _mark_character_form_dirty(self) -> None:
+        if getattr(self, "loading_editor", False):
+            return
         self._character_form_dirty = True
 
     def _refresh_book_cover_preview(self) -> None:
@@ -4710,22 +5174,35 @@ class NovelQtMainWindow(QMainWindow):
         self.selected_character_id = self.database.create_character(self.state.selected_book_id, name)
         self._character_form_dirty = False
         self._refresh_drawer()
+        self._open_character_detail_dialog(self.selected_character_id)
 
     def _save_character(self, _checked: bool = False, *, refresh: bool = True) -> bool:
         if not self.selected_character_id:
             info(self, "提示", "请先选择或创建一个人物。")
             return False
-        self.database.update_character(
+        name = self.character_name.text().strip() or "未命名人物"
+        role = self.character_role.text().strip()
+        profile_data = self.character_profile_form.to_data(name, role)
+        self.database.update_character_form(
             self.selected_character_id,
-            self.character_name.text().strip() or "未命名人物",
-            self.character_role.text().strip(),
-            self.character_profile.toPlainText().strip(),
+            name,
+            role,
+            profile_data,
             image_path=self.database.normalize_media_path(self.character_image_path),
         )
+        self.character_name.setText(name)
+        self.character_role.setText(role)
+        self.character_profile_form.set_data(profile_data, name, role)
+        self._refresh_character_markdown_preview()
         self._character_form_dirty = False
+        if self.state.selected_book_id:
+            self._sync_truth_files(self.state.selected_book_id)
+            self._index_book_design_for_rag(self.state.selected_book_id)
         self._set_status("人物设定已保存")
         if refresh:
             self._refresh_drawer()
+        else:
+            self._refresh_character_list()
         return True
 
     def _import_character_file(self) -> None:
@@ -4748,8 +5225,17 @@ class NovelQtMainWindow(QMainWindow):
         if not text.strip():
             info(self, "导入文件", "文件内容为空。")
             return
-        self.character_profile.setPlainText(text.strip())
-        self._set_status("人物设定文件已载入编辑区，请核对后保存。")
+        data = merge_character_profile_supplement(
+            self.character_profile_form.to_data(self.character_name.text(), self.character_role.text()),
+            self.character_name.text(),
+            self.character_role.text(),
+            text.strip(),
+            supplement_title=f"导入补充 · {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        )
+        self.character_profile_form.set_data(data, self.character_name.text(), self.character_role.text())
+        self._refresh_character_markdown_preview()
+        self._mark_character_form_dirty()
+        self._set_status("人物设定文件已载入补充区，请核对后保存。")
 
     def _delete_character(self) -> None:
         if not self.selected_character_id:
@@ -4757,42 +5243,16 @@ class NovelQtMainWindow(QMainWindow):
         if confirm(self, "删除人物", "确定删除当前人物吗？", danger=True):
             self.database.delete_character(self.selected_character_id)
             self.selected_character_id = None
+            if self.character_detail_dialog:
+                self.character_detail_dialog.close()
             self._refresh_drawer()
-
-    def _on_world_selected(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
-        if not self._confirm_world_edit_navigation():
-            if _previous:
-                self.world_list.setCurrentItem(_previous)
-            return
-        if not current:
-            self._clear_world_form()
-            return
-        entry_id = int(current.data(Qt.ItemDataRole.UserRole))
-        self._load_world_form(entry_id)
-
-    def _load_world_form(self, entry_id: int) -> None:
-        detail = self.database.get_world_entry(entry_id)
-        if not detail:
-            return
-        self.selected_world_entry_id = entry_id
-        self.world_name.setText(str(detail["name"]))
-        self.world_category.setText(str(detail["category"] or "设定"))
-        self.world_content.setPlainText(str(detail["content_text"] or ""))
-        self._world_form_dirty = False
-
-    def _clear_world_form(self) -> None:
-        self.selected_world_entry_id = None
-        self.world_name.clear()
-        self.world_category.clear()
-        self.world_content.clear()
-        self._world_form_dirty = False
 
     def _confirm_world_edit_navigation(self) -> bool:
         if not getattr(self, "_world_form_dirty", False):
             return True
-        if not self.selected_world_entry_id:
+        if not self.state.selected_book_id:
             return True
-        choice = self._ask_save_discard_cancel("未保存的世界观修改", "当前世界观条目有未保存的修改，切换前要保存吗？")
+        choice = self._ask_save_discard_cancel("未保存的世界观修改", "当前世界观设定有未保存的修改，切换前要保存吗？")
         if choice == "cancel":
             return False
         if choice == "save":
@@ -4804,35 +5264,29 @@ class NovelQtMainWindow(QMainWindow):
         self._world_form_dirty = True
 
     def _create_world_entry(self) -> None:
-        if not self.state.selected_book_id:
-            info(self, "提示", "请先选择一本书。")
-            return
-        name = ask_text(self, "新建世界观条目", "请输入条目名称：")
-        if not name:
-            return
-        self.selected_world_entry_id = self.database.create_world_entry(self.state.selected_book_id, name)
-        self._world_form_dirty = False
-        self._refresh_drawer()
+        self._load_world_form_for_book(self.state.selected_book_id)
 
     def _save_world_entry(self, _checked: bool = False, *, refresh: bool = True) -> bool:
-        if not self.selected_world_entry_id:
-            info(self, "提示", "请先选择或创建一个世界观条目。")
+        if not self.state.selected_book_id:
+            info(self, "提示", "请先选择一本书。")
             return False
-        self.database.update_world_entry(
-            self.selected_world_entry_id,
-            self.world_name.text().strip() or "未命名条目",
-            self.world_category.text().strip() or "设定",
-            self.world_content.toPlainText().strip(),
-        )
+        if not hasattr(self, "world_form"):
+            return False
+        world_data = self.world_form.to_data()
+        self.database.update_book_world_form(self.state.selected_book_id, world_data)
+        self._refresh_world_markdown_preview()
         self._world_form_dirty = False
-        self._set_status("世界观条目已保存")
+        self._world_form_book_id = self.state.selected_book_id
+        self._sync_truth_files(self.state.selected_book_id)
+        self._index_book_design_for_rag(self.state.selected_book_id)
+        self._set_status("世界观设定已保存")
         if refresh:
             self._refresh_drawer()
         return True
 
     def _import_world_file(self) -> None:
-        if not self.selected_world_entry_id:
-            info(self, "提示", "请先选择或创建一个世界观条目。")
+        if not self.state.selected_book_id:
+            info(self, "提示", "请先选择一本书。")
             return
         file_path, _ = QFileDialog.getOpenFileName(
             self,
@@ -4850,16 +5304,17 @@ class NovelQtMainWindow(QMainWindow):
         if not text.strip():
             info(self, "导入文件", "文件内容为空。")
             return
-        self.world_content.setPlainText(text.strip())
-        self._set_status("世界观设定文件已载入编辑区，请核对后保存。")
+        data = merge_world_supplement(
+            self.world_form.to_data() if hasattr(self, "world_form") else self.database.get_book_world_form(self.state.selected_book_id),
+            text,
+            supplement_title=f"导入补充 · {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        )
+        self.world_form.set_data(data)
+        self._on_world_form_changed()
+        self._set_status("世界观设定文件已载入补充区，请核对后保存。")
 
     def _delete_world_entry(self) -> None:
-        if not self.selected_world_entry_id:
-            return
-        if confirm(self, "删除世界观条目", "确定删除当前条目吗？", danger=True):
-            self.database.delete_world_entry(self.selected_world_entry_id)
-            self.selected_world_entry_id = None
-            self._refresh_drawer()
+        self._fill_world_template()
 
     def _get_bound_skill_payload(self) -> list[dict[str, Any]]:
         payload: list[dict[str, Any]] = []
@@ -4882,7 +5337,7 @@ class NovelQtMainWindow(QMainWindow):
         lines = [f"书籍：{self.state.selected_book_title}"]
         book_outline = str(export_data.get("book", {}).get("outline_text", "")).strip()
         if book_outline:
-            lines.append(f"书籍大纲：{book_outline[:700]}")
+            lines.append(f"书籍级结构化设定：{book_outline[:2000]}")
         if self.state.selected_volume_id:
             for volume in export_data.get("volumes", []):
                 if int(volume.get("id", -1)) == self.state.selected_volume_id:
@@ -4895,13 +5350,13 @@ class NovelQtMainWindow(QMainWindow):
             lines.append("人物设定：")
             for item in characters:
                 label = f"{item.get('name', '')}（{item.get('role', '')}）" if item.get("role") else str(item.get("name", ""))
-                lines.append(f"- {label}：{str(item.get('profile_text', '')).strip()[:180] or '暂无简介'}")
+                lines.append(f"- {label}：{str(item.get('profile_text', '')).strip()[:600] or '暂无简介'}")
         world_entries = export_data.get("world_entries", [])[:8]
         if world_entries:
             lines.append("世界观规则：")
             for item in world_entries:
                 label = f"{item.get('name', '')} [{item.get('category', '')}]" if item.get("category") else str(item.get("name", ""))
-                lines.append(f"- {label}：{str(item.get('content_text', '')).strip()[:180] or '暂无内容'}")
+                lines.append(f"- {label}：{str(item.get('content_text', '')).strip()[:600] or '暂无内容'}")
         current_chapter_id = self.state.selected_chapter_id
         recent: list[str] = []
         for item in export_data.get("chapters", []):
@@ -4935,6 +5390,32 @@ class NovelQtMainWindow(QMainWindow):
                 summary=str(chapter["summary_text"] or ""),
                 outline=str(chapter["outline"] or ""),
                 content_snippet=str(chapter["content"] or "")[:800],
+            )
+        except Exception:
+            pass
+
+    def _index_book_design_for_rag(self, book_id: int) -> None:
+        try:
+            book = self.database.get_book(book_id)
+            if not book:
+                return
+            character_blocks: list[str] = []
+            for character in self.database.list_characters(book_id):
+                name = str(character["name"] or "").strip()
+                role = str(character["role"] or "").strip()
+                profile = str(character["profile_text"] or "").strip()
+                if profile:
+                    heading = f"### {name}" + (f"（{role}）" if role else "")
+                    character_blocks.append(f"{heading}\n\n{profile}")
+            character_markdown = "\n\n".join(character_blocks)
+            self.rag_retriever.index_book_design(
+                book_id=book_id,
+                title=str(book["title"] or ""),
+                markdown=(
+                    f"{str(book['outline_text'] or '').strip()}"
+                    f"\n\n## 世界观设定\n{str(book['world_text'] or '').strip()}"
+                    f"\n\n## 人物卡设定\n{character_markdown}"
+                ).strip(),
             )
         except Exception:
             pass
@@ -4987,49 +5468,13 @@ class NovelQtMainWindow(QMainWindow):
         return "\n".join(lines)
 
     def _set_drawer_tab(self, key: str) -> None:
-        index = self.drawer_tab_indexes.get(key)
-        if index is not None:
-            self.drawer_tabs.setCurrentIndex(index)
+        return self.drawer_controller.set_tab(key)
 
     def _update_drawer_title(self) -> None:
-        if not hasattr(self, "drawer_tabs"):
-            return
-        tab_label = self.drawer_tabs.tabText(self.drawer_tabs.currentIndex()) or "详情"
-        subject = (
-            getattr(self.state, "selected_chapter_title", "")
-            or getattr(self.state, "selected_volume_title", "")
-            or self.state.selected_book_title
-            or "当前书籍"
-        )
-        title = f"{tab_label} · {subject}" if subject else tab_label
-        if hasattr(self, "drawer_title_label"):
-            self.drawer_title_label.setText(title)
+        return self.drawer_controller.update_title()
 
     def _open_drawer(self, kind: str = "details") -> None:
-        if kind == "star" and not self._is_book_level_selected():
-            info(self, "人物星图", "人物星图只在书籍级界面显示。请先在左侧选择书籍。")
-            return
-        self.state.drawer_kind = kind
-        self._sync_star_tab_visibility()
-        wide_drawer = kind in {"tasks", "review"}
-        drawer_min_width = 340 if wide_drawer else 320
-        base_width = 420 if wide_drawer else 380
-        desired_width = max(self.qt_drawer_width, base_width)
-        max_drawer_width = max(drawer_min_width, self.width() - 720)
-        desired_width = min(desired_width, max_drawer_width)
-        if kind == "tasks":
-            self._set_drawer_tab("tasks")
-        elif kind == "star":
-            self._set_drawer_tab("star")
-        elif kind == "review":
-            self._set_drawer_tab("review")
-        else:
-            self._set_drawer_tab("outline")
-        self._update_drawer_title()
-        self.drawer.setMinimumWidth(drawer_min_width)
-        self.drawer.setVisible(True)
-        self.drawer.setFixedWidth(desired_width)
-        self._refresh_drawer()
+        return self.drawer_controller.open(kind)
 
     def _hide_drawer(self) -> None:
         if hasattr(self, "drawer") and self.drawer.isVisible():
@@ -5175,11 +5620,6 @@ class NovelQtMainWindow(QMainWindow):
         if hasattr(self, "_status_fade_timer"):
             self._status_fade_timer.start(5000)
 
-    def _toggle_correction_ai_detection(self, checked: bool) -> None:
-        self.correction_ai_enabled = bool(checked)
-        self._save_ui_settings()
-        self._set_status("纠错 AI 检测已启用" if self.correction_ai_enabled else "纠错 AI 检测已关闭")
-
     def _toggle_auto_save(self, checked: bool) -> None:
         self.auto_save_enabled = bool(checked)
         self._sync_auto_save_timer()
@@ -5256,11 +5696,18 @@ class NovelQtMainWindow(QMainWindow):
             return []
         return self._named_book_characters(self.state.selected_book_id)
 
-    def _build_chat_context_prompt(self, character: dict[str, Any] | None = None) -> str:
+    def _build_chat_context_prompt(
+        self,
+        ai_character: dict[str, Any] | None = None,
+        self_character: dict[str, Any] | None = None,
+        latest_user_message: str = "",
+    ) -> str:
         lines = [
-            "你是一个中文小说写作助手，可以自由回答作者问题，也可以协助纠错、设定、情节和文风判断。",
-            "请优先尊重作者当前文本，不要擅自覆盖正文；如果需要改写，请给出可复制片段。",
+            self._prompt_text("chat.system", BUILTIN_CHAT_SYSTEM_PROMPT),
         ]
+        latest_user_message = str(latest_user_message or "").strip()
+        if latest_user_message:
+            lines.append(f"【当前用户请求】\n{latest_user_message[:1200]}")
         if self.state.selected_book_title:
             lines.append(f"作品名称：{self.state.selected_book_title}")
         if self.state.selected_volume_id:
@@ -5271,8 +5718,8 @@ class NovelQtMainWindow(QMainWindow):
             chapter = self.database.get_chapter(self.state.selected_chapter_id)
             if chapter:
                 lines.append(f"当前章节：{chapter['title']}")
-                outline = str(chapter["outline"] or self.chapter_outline_editor.toPlainText()).strip()
-                content = str(chapter["content"] or self.content_editor.toPlainText()).strip()
+                outline = self.chapter_outline_editor.toPlainText().strip() or str(chapter["outline"] or "").strip()
+                content = self.content_editor.toPlainText().strip() or str(chapter["content"] or "").strip()
                 if outline:
                     lines.append(f"章节大纲：{outline[:1200]}")
                 if content:
@@ -5281,15 +5728,48 @@ class NovelQtMainWindow(QMainWindow):
                 if runs:
                     lines.append(f"最近审查摘要：{str(runs[0]['summary'] or '')[:500]}")
         if self.state.selected_book_id:
-            lines.append(self._build_book_chat_context(self.state.selected_book_id))
-        if character:
-            lines.append(self._build_character_chat_prompt(character))
+            book_id = int(self.state.selected_book_id)
+            chapter_id = int(self.state.selected_chapter_id) if self.state.selected_chapter_id else None
+            truth_context = self._build_truth_context(book_id, chapter_id, max_chars=9000)
+            if truth_context:
+                lines.append(f"【Truth File：必须优先遵守】\n{truth_context}")
+            rag_query = self._build_chat_rag_query(latest_user_message, ai_character, self_character)
+            if rag_query:
+                self._index_book_design_for_rag(book_id)
+                rag_context = self._build_rag_context(book_id, rag_query, top_k=6)
+                if rag_context:
+                    lines.append(f"【RAG 检索结果：与当前问题相关】\n{rag_context}")
+            lines.append(self._build_book_chat_context(book_id, max_chars=7000))
+        if ai_character:
+            lines.append(self._build_character_chat_prompt(ai_character, self_character))
         skills = self._get_bound_skill_payload() if self.state.selected_book_id else []
         if skills:
             lines.append("启用 Skills：")
             for skill in skills[:10]:
                 lines.append(f"- {skill.get('name', '')}：{str(skill.get('instruction_text', '')).strip()[:180]}")
         return "\n".join(line for line in lines if str(line).strip())
+
+    def _build_chat_rag_query(
+        self,
+        latest_user_message: str,
+        ai_character: dict[str, Any] | None = None,
+        self_character: dict[str, Any] | None = None,
+    ) -> str:
+        query_parts = [str(latest_user_message or "").strip()]
+        if self.state.selected_book_title:
+            query_parts.append(str(self.state.selected_book_title))
+        if self.state.selected_chapter_id:
+            chapter = self.database.get_chapter(self.state.selected_chapter_id)
+            if chapter:
+                query_parts.append(str(chapter["title"] or ""))
+                query_parts.append(self.chapter_outline_editor.toPlainText().strip() or str(chapter["outline"] or ""))
+                query_parts.append(self.content_editor.toPlainText().strip()[:800])
+        for character in (ai_character, self_character):
+            if character:
+                query_parts.append(str(character.get("name", "") or ""))
+                query_parts.append(str(character.get("role", "") or ""))
+                query_parts.append(str(character.get("profile_text", "") or "")[:600])
+        return "\n".join(part for part in query_parts if part.strip())[:3000]
 
     def _build_book_chat_context(self, book_id: int, max_chars: int = 16000) -> str:
         book = self.database.get_book(book_id)
@@ -5323,35 +5803,52 @@ class NovelQtMainWindow(QMainWindow):
             pieces.append("全书正文与章节摘要节选：\n" + "\n\n".join(chapter_blocks))
         return "\n\n".join(pieces)
 
-    def _build_character_chat_prompt(self, character: dict[str, Any]) -> str:
-        name = str(character.get("name", "") or "").strip()
-        detail = self.database.get_character(int(character.get("id", 0) or 0)) if character.get("id") else None
-        record = dict(detail) if detail else character
+    def _build_character_chat_prompt(self, ai_character: dict[str, Any], self_character: dict[str, Any] | None = None) -> str:
+        name = str(ai_character.get("name", "") or "").strip()
+        detail = self.database.get_character(int(ai_character.get("id", 0) or 0)) if ai_character.get("id") else None
+        record = dict(detail) if detail else ai_character
         role = str(record.get("role", "") or "").strip()
         profile = str(record.get("profile_text", "") or "").strip()
-        return "\n".join(
-            [
-                "【角色对话模式】",
-                f"现在你直接代入书中人物「{name}」。",
-                f"角色定位：{role or '未设定'}",
-                f"人物设定：{profile or '暂无明确设定，请从全书上下文推断但不要编造关键事实。'}",
-                "回答规则：",
-                "- 以该角色的第一人称口吻和认知边界回答作者。",
-                "- 你已阅读上方全书上下文，应结合剧情、关系和人物经历说话。",
-                "- 不要跳出角色解释自己是 AI；除非作者要求写作建议，否则保持角色身份。",
-                "- 不确定的设定可以用角色视角表达犹疑，不要硬编书中没有的事实。",
-            ]
+        self_name = str(self_character.get("name", "") or "").strip() if self_character else ""
+        self_line = (
+            f"正在与你对话的人是「{self_name}」，请以「{name}」的视角和口吻回应。"
+            if self_name
+            else ""
         )
+        return render_prompt(
+            self._prompt_text("chat.character_template", CHARACTER_CHAT_PROMPT_TEMPLATE),
+            {
+                "name": name,
+                "role": role or "未设定",
+                "profile": profile or "暂无明确设定，请从全书上下文推断但不要编造关键事实。",
+                "self_name": self_name,
+                "self_line": self_line,
+            },
+        )
+        result_lines = [
+            "【角色对话模式】",
+            f"现在你直接代入书中人物「{name}」。",
+            f"角色定位：{role or '未设定'}",
+            f"人物设定：{profile or '暂无明确设定，请从全书上下文推断但不要编造关键事实。'}",
+        ]
+        if self_character:
+            self_name = str(self_character.get("name", "") or "").strip()
+            result_lines.append(f"正在与你对话的人是「{self_name}」，请以「{name}」的视角和口吻回应。")
+        result_lines.extend([
+            "回答规则：",
+            "- 以该角色的第一人称口吻和认知边界回答作者。",
+            "- 你已阅读上方全书上下文，应结合剧情、关系和人物经历说话。",
+            "- 不要跳出角色解释自己是 AI；除非作者要求写作建议，否则保持角色身份。",
+            "- 不确定的设定可以用角色视角表达犹疑，不要硬编书中没有的事实。",
+        ])
+        return "\n".join(result_lines)
 
     def _get_previous_chapters_context(
         self, book_id: int, current_chapter_id: int, limit: int = 3
     ) -> list[dict[str, Any]]:
         chapters = self.database.list_chapters(book_id)
         previous: list[dict[str, Any]] = []
-        for row in chapters:
-            cid = int(row["id"])
-            if cid == current_chapter_id:
-                break
+        for cid in previous_chapter_ids_in_order(chapters, current_chapter_id, limit):
             chapter = self.database.get_chapter(cid)
             if chapter:
                 previous.append({
@@ -5361,8 +5858,7 @@ class NovelQtMainWindow(QMainWindow):
                     "content": str(chapter["content"] or ""),
                     "sort_order": int(chapter["sort_order"] or 0),
                 })
-        previous.sort(key=lambda x: x["sort_order"])
-        return previous[-limit:]
+        return previous
 
     def _start_multi_agent_generation(self) -> None:
         if not self.state.selected_chapter_id:
@@ -5639,7 +6135,7 @@ class NovelQtMainWindow(QMainWindow):
         if not chapters:
             info(self, "全书分析", "当前书籍还没有章节。")
             return
-        if not confirm(self, "AI 分析全书", f"将分批分析《{book['title']}》的 {len(chapters)} 个章节，并增量写入人物、世界观、大纲和事件。是否继续？"):
+        if not confirm(self, "AI 分析全书", f"将以三级金字塔分析《{book['title']}》的 {len(chapters)} 个章节，并覆盖写入人物、世界观、大纲和事件。是否继续？"):
             return
         self._open_drawer("tasks")
         book_id = int(self.state.selected_book_id)
@@ -5685,63 +6181,1355 @@ class NovelQtMainWindow(QMainWindow):
         log: Callable[[str], None],
         cancel_event: Event | None = None,
     ) -> dict[str, Any]:
-        batch_size = 8
-        batches = [chapters[index : index + batch_size] for index in range(0, len(chapters), batch_size)]
-        merged: dict[str, Any] = {
-            "book_outline": "",
-            "characters": [],
-            "world_entries": [],
-            "chapter_updates": [],
-            "_meta": {
-                "processed_chapters": 0,
-                "remote_failed_batches": 0,
-                "batch_count": len(batches),
-            },
+        max_retries = self._safe_int(
+            getattr(self, "ai_request_retries", DEFAULT_AI_REQUEST_RETRIES),
+            DEFAULT_AI_REQUEST_RETRIES,
+            0,
+            5,
+        )
+        concurrency = self._safe_int(
+            getattr(self, "book_analysis_concurrency", DEFAULT_BOOK_ANALYSIS_CONCURRENCY),
+            DEFAULT_BOOK_ANALYSIS_CONCURRENCY,
+            1,
+            8,
+        )
+        fast_extra_body = self._parse_json_object_text(
+            getattr(self, "book_analysis_fast_extra_body", DEFAULT_BOOK_ANALYSIS_FAST_EXTRA_BODY_JSON),
+            "一级/二级额外请求参数 JSON",
+        )
+        final_extra_body = self._parse_json_object_text(
+            getattr(self, "book_analysis_final_extra_body", DEFAULT_BOOK_ANALYSIS_FINAL_EXTRA_BODY_JSON),
+            "三级额外请求参数 JSON",
+        )
+        source_chunks = self._build_book_analysis_source_chunks(chapters, max_chars=20000)
+        if not source_chunks:
+            raise RuntimeError("全书分析没有可读取的章节内容。")
+        log(f"全书分析：已按 20000 字切为 {len(source_chunks)} 个一级片段，并发数 {concurrency}。")
+
+        def level1_task(index: int, chunk: dict[str, Any]) -> dict[str, Any]:
+            service = ai_service.clone()
+            payload = service.analyze_book_level1(
+                book_title=book_title,
+                book_outline=book_outline,
+                chunk_text=str(chunk.get("text", "")),
+                chunk_index=index + 1,
+                total_chunks=len(source_chunks),
+                chunk_id=str(chunk.get("chunk_id", "")),
+                chapter_ids=[int(chapter_id) for chapter_id in chunk.get("chapter_ids", []) if str(chapter_id).strip()],
+                extra_body=fast_extra_body,
+                require_remote=True,
+            )
+            payload.setdefault("chunk_id", chunk.get("chunk_id"))
+            payload.setdefault("chapter_ids", chunk.get("chapter_ids", []))
+            return payload
+
+        level1_results = self._run_book_analysis_parallel_stage(
+            stage_label="一级解读",
+            items=source_chunks,
+            worker=level1_task,
+            max_workers=concurrency,
+            max_retries=max_retries,
+            log=log,
+            cancel_event=cancel_event,
+        )
+        if cancel_event and cancel_event.is_set():
+            raise RuntimeError("全书分析已取消。")
+
+        level1_results_for_level2 = self._compact_book_analysis_level1_for_level2(level1_results)
+        raw_level1_chars = len(json.dumps(level1_results, ensure_ascii=False))
+        compact_level1_chars = len(json.dumps(level1_results_for_level2, ensure_ascii=False))
+        log(
+            "全书分析：已压缩一级输入，"
+            f"{raw_level1_chars} 字符 -> {compact_level1_chars} 字符，发送给二级。"
+        )
+
+        level2_groups = self._group_book_analysis_level1_results(level1_results_for_level2)
+        log(f"全书分析：一级结果整理为 {len(level2_groups)} 个二级分组。")
+
+        def level2_task(index: int, group: list[dict[str, Any]]) -> dict[str, Any]:
+            service = ai_service.clone()
+            return service.analyze_book_level2(
+                book_title=book_title,
+                level1_results=group,
+                group_index=index + 1,
+                total_groups=len(level2_groups),
+                extra_body=fast_extra_body,
+                require_remote=True,
+            )
+
+        level2_results = self._run_book_analysis_parallel_stage(
+            stage_label="二级整理",
+            items=level2_groups,
+            worker=level2_task,
+            max_workers=concurrency,
+            max_retries=max_retries,
+            log=log,
+            cancel_event=cancel_event,
+        )
+        if cancel_event and cancel_event.is_set():
+            raise RuntimeError("全书分析已取消。")
+
+        log("全书分析：三级草案正在整合全部二级结果并检查证据缺口。")
+
+        source_index = self._book_analysis_source_index_summary(source_chunks)
+        level2_results_for_level3 = self._compact_book_analysis_level2_for_level3(level2_results)
+        raw_level2_chars = len(json.dumps(level2_results, ensure_ascii=False))
+        compact_level2_chars = len(json.dumps(level2_results_for_level3, ensure_ascii=False))
+        log(
+            "全书分析：已压缩二级输入，"
+            f"{raw_level2_chars} 字符 -> {compact_level2_chars} 字符，发送给三级。"
+        )
+
+        def level3_draft_call() -> dict[str, Any]:
+            service = ai_service.clone()
+            return service.analyze_book_level3_draft(
+                book_title=book_title,
+                book_outline=book_outline,
+                level2_results=level2_results_for_level3,
+                chapters=chapters,
+                characters=characters,
+                world_entries=world_entries,
+                source_index=source_index,
+                extra_body=final_extra_body,
+                require_remote=True,
+            )
+
+        draft_payload = self._run_book_analysis_with_retries(
+            label="三级草案",
+            call=level3_draft_call,
+            max_retries=max_retries,
+            log=log,
+            cancel_event=cancel_event,
+        )
+        if not isinstance(draft_payload, dict):
+            raise RuntimeError("三级草案没有返回有效 JSON 对象。")
+        source_requests = self._analysis_source_requests(draft_payload)
+        source_context: dict[str, Any] = {"requests": [], "snippets": [], "unresolved_requests": []}
+        payload = draft_payload
+        if source_requests:
+            source_context = self._build_book_analysis_source_context(source_requests, source_chunks)
+            log(
+                "全书分析：三级请求原文回查 "
+                f"{len(source_requests)} 项，命中 {len(source_context.get('snippets', []))} 段。"
+            )
+
+            if source_context.get("snippets"):
+                def level3_finalize_call() -> dict[str, Any]:
+                    service = ai_service.clone()
+                    return service.analyze_book_level3_finalize(
+                        book_title=book_title,
+                        book_outline=book_outline,
+                        level2_results=level2_results_for_level3,
+                        draft_payload=draft_payload,
+                        source_context=source_context,
+                        chapters=chapters,
+                        characters=characters,
+                        world_entries=world_entries,
+                        extra_body=final_extra_body,
+                        require_remote=True,
+                    )
+
+                payload = self._run_book_analysis_with_retries(
+                    label="三级原文复核",
+                    call=level3_finalize_call,
+                    max_retries=max_retries,
+                    log=log,
+                    cancel_event=cancel_event,
+                )
+                local_unresolved = source_context.get("unresolved_requests", [])
+                if isinstance(payload, dict) and isinstance(local_unresolved, list) and local_unresolved:
+                    unresolved = payload.setdefault("analysis_unresolved", [])
+                    if isinstance(unresolved, list):
+                        unresolved.extend(local_unresolved)
+            else:
+                unresolved = draft_payload.setdefault("analysis_unresolved", [])
+                if isinstance(unresolved, list):
+                    unresolved.extend(source_context.get("unresolved_requests", []))
+        if not isinstance(payload, dict):
+            raise RuntimeError("三级终审没有返回有效 JSON 对象。")
+        payload["_requires_evidence"] = True
+        payload = self._filter_untrusted_book_analysis_payload(payload)
+        unresolved_count = len(payload.get("analysis_unresolved", [])) if isinstance(payload.get("analysis_unresolved"), list) else 0
+        log(
+            "全书分析：三级证据门禁完成，"
+            f"回查 {len(source_requests)} 项，待确认 {unresolved_count} 项。"
+        )
+        payload["_meta"] = {
+            **(payload.get("_meta", {}) if isinstance(payload.get("_meta"), dict) else {}),
+            "processed_chapters": len(chapters),
+            "level1_count": len(level1_results),
+            "level1_input_chars": raw_level1_chars,
+            "level1_compacted_input_chars": compact_level1_chars,
+            "level2_count": len(level2_results),
+            "level2_input_chars": raw_level2_chars,
+            "level2_compacted_input_chars": compact_level2_chars,
+            "api_retry_limit": max_retries,
+            "concurrency": concurrency,
+            "analysis_pipeline": "three_level_pyramid_v2_source_review",
+            "source_request_count": len(source_requests),
+            "source_snippet_count": len(source_context.get("snippets", [])),
+            "analysis_unresolved_count": unresolved_count,
         }
-        local_service = SimpleAIService()
-        for batch_index, batch in enumerate(batches, start=1):
-            if cancel_event and cancel_event.is_set():
-                log("全书分析已停止。")
+        return payload
+
+    def _build_book_analysis_text_chunks(
+        self,
+        chapters: list[dict[str, Any]],
+        *,
+        max_chars: int = 20000,
+    ) -> list[str]:
+        return [
+            str(chunk.get("text", ""))
+            for chunk in self._build_book_analysis_source_chunks(chapters, max_chars=max_chars)
+        ]
+
+    def _build_book_analysis_source_chunks(
+        self,
+        chapters: list[dict[str, Any]],
+        *,
+        max_chars: int = 20000,
+    ) -> list[dict[str, Any]]:
+        parts: list[str] = []
+        chapter_ranges: list[dict[str, Any]] = []
+        cursor = 0
+        for item in chapters:
+            chapter_id = item.get("id", "")
+            title = str(item.get("title", "") or "")
+            outline = str(item.get("outline", "") or "")
+            content = str(item.get("content", "") or "")
+            block = (
+                "\n\n"
+                f"[chapter_id={chapter_id}]\n"
+                f"标题：{title}\n"
+                f"大纲：{outline}\n"
+                f"正文：\n{content}"
+            )
+            start = cursor
+            end = start + len(block)
+            parts.append(block)
+            chapter_ranges.append(
+                {
+                    "id": chapter_id,
+                    "title": title,
+                    "char_start": start,
+                    "char_end": end,
+                }
+            )
+            cursor = end
+        full_text = "".join(parts).strip()
+        if not full_text:
+            return []
+        limit = max(1, int(max_chars))
+        chunks: list[dict[str, Any]] = []
+        for chunk_index, start in enumerate(range(0, len(full_text), limit), start=1):
+            end = min(len(full_text), start + limit)
+            text = full_text[start:end]
+            covered = [
+                item
+                for item in chapter_ranges
+                if int(item["char_end"]) > start and int(item["char_start"]) < end
+            ]
+            chapter_ids: list[int] = []
+            chapter_refs: list[dict[str, Any]] = []
+            for item in covered:
+                try:
+                    chapter_id_int = int(item.get("id"))
+                except (TypeError, ValueError):
+                    continue
+                if chapter_id_int not in chapter_ids:
+                    chapter_ids.append(chapter_id_int)
+                    chapter_refs.append(
+                        {
+                            "id": chapter_id_int,
+                            "title": str(item.get("title", "")),
+                        }
+                    )
+            chunks.append(
+                {
+                    "chunk_id": f"chunk-{chunk_index:04d}",
+                    "chunk_index": chunk_index,
+                    "text": text,
+                    "chapter_ids": chapter_ids,
+                    "chapter_refs": chapter_refs,
+                    "char_start": start,
+                    "char_end": end,
+                }
+            )
+        return chunks
+
+    @staticmethod
+    def _book_analysis_source_index_summary(source_chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        summary: list[dict[str, Any]] = []
+        for chunk in source_chunks:
+            text = str(chunk.get("text", ""))
+            summary.append(
+                {
+                    "chunk_id": chunk.get("chunk_id"),
+                    "chunk_index": chunk.get("chunk_index"),
+                    "chapter_ids": chunk.get("chapter_ids", []),
+                    "chapters": chunk.get("chapter_refs", []),
+                    "char_count": len(text),
+                    "preview": text[:220],
+                }
+            )
+        return summary
+
+    @staticmethod
+    def _analysis_source_requests(payload: dict[str, Any]) -> list[dict[str, Any]]:
+        requests_value: Any = None
+        for key in ("source_requests", "source_request", "verification_requests", "原文回查请求"):
+            value = payload.get(key)
+            if value:
+                requests_value = value
                 break
-            log(f"全书分析：第 {batch_index}/{len(batches)} 批，{len(batch)} 章。")
+        if isinstance(requests_value, dict):
+            requests_value = [requests_value]
+        if not isinstance(requests_value, list):
+            return []
+        requests: list[dict[str, Any]] = []
+        for index, item in enumerate(requests_value, start=1):
+            if isinstance(item, dict):
+                request_item = dict(item)
+            else:
+                text = str(item or "").strip()
+                if not text:
+                    continue
+                request_item = {"reason": text, "keywords": [text[:40]]}
+            request_item.setdefault("request_id", f"source-{index:02d}")
+            requests.append(request_item)
+        return requests
+
+    def _build_book_analysis_source_context(
+        self,
+        source_requests: list[dict[str, Any]],
+        source_chunks: list[dict[str, Any]],
+        *,
+        max_requests: int = BOOK_ANALYSIS_SOURCE_REQUEST_LIMIT,
+        snippets_per_request: int = BOOK_ANALYSIS_SOURCE_SNIPPETS_PER_REQUEST,
+        snippet_chars: int = BOOK_ANALYSIS_SOURCE_SNIPPET_CHARS,
+        max_total_chars: int = BOOK_ANALYSIS_SOURCE_CONTEXT_CHARS,
+    ) -> dict[str, Any]:
+        requests = [dict(item) for item in source_requests[: max(1, int(max_requests))] if isinstance(item, dict)]
+        snippets: list[dict[str, Any]] = []
+        unresolved: list[dict[str, Any]] = []
+        total_chars = 0
+        max_total = max(1, int(max_total_chars))
+        per_snippet = max(80, int(snippet_chars))
+        per_request = max(1, int(snippets_per_request))
+
+        def keyword_list(item: dict[str, Any]) -> list[str]:
+            raw_keywords = item.get("keywords") or item.get("keyword") or item.get("terms")
+            values: list[str] = []
+            if isinstance(raw_keywords, str):
+                values.extend(part.strip() for part in re.split(r"[,，、\s]+", raw_keywords) if part.strip())
+            elif isinstance(raw_keywords, list):
+                values.extend(str(part).strip() for part in raw_keywords if str(part).strip())
+            for key in ("target_field", "subject", "question", "reason"):
+                text = str(item.get(key, "") or "").strip()
+                if text:
+                    values.extend(part.strip() for part in re.split(r"[,，、\s]+", text) if len(part.strip()) >= 2)
+            seen: set[str] = set()
+            ordered: list[str] = []
+            for value in values:
+                if value and value not in seen:
+                    seen.add(value)
+                    ordered.append(value)
+            return ordered[:8]
+
+        def candidate_chunks(item: dict[str, Any], keywords: list[str]) -> list[dict[str, Any]]:
+            chunk_id = str(item.get("chunk_id", "") or "").strip()
+            if chunk_id:
+                matched = [chunk for chunk in source_chunks if str(chunk.get("chunk_id")) == chunk_id]
+                if matched:
+                    return matched
+            chapter_id_value = item.get("chapter_id")
+            chapter_ids: set[int] = set()
+            if isinstance(chapter_id_value, list):
+                for value in chapter_id_value:
+                    try:
+                        chapter_ids.add(int(value))
+                    except (TypeError, ValueError):
+                        continue
+            else:
+                try:
+                    if chapter_id_value not in (None, ""):
+                        chapter_ids.add(int(chapter_id_value))
+                except (TypeError, ValueError):
+                    chapter_ids = set()
+            if chapter_ids:
+                matched = []
+                for chunk in source_chunks:
+                    chunk_chapter_ids: set[int] = set()
+                    for value in chunk.get("chapter_ids", []):
+                        try:
+                            chunk_chapter_ids.add(int(value))
+                        except (TypeError, ValueError):
+                            continue
+                    if chapter_ids.intersection(chunk_chapter_ids):
+                        matched.append(chunk)
+                if matched:
+                    return matched
+            if keywords:
+                matched = [
+                    chunk
+                    for chunk in source_chunks
+                    if any(keyword and keyword in str(chunk.get("text", "")) for keyword in keywords)
+                ]
+                if matched:
+                    return matched
+            return list(source_chunks)
+
+        for request_item in requests:
+            if total_chars >= max_total:
+                unresolved.append({**request_item, "reason": "回查总字数已达上限"})
+                continue
+            keywords = keyword_list(request_item)
+            candidates = candidate_chunks(request_item, keywords)
+            if not candidates:
+                unresolved.append({**request_item, "reason": "未找到匹配原文切片"})
+                continue
+            added = 0
+            for chunk in candidates:
+                if added >= per_request or total_chars >= max_total:
+                    break
+                text = str(chunk.get("text", ""))
+                if not text:
+                    continue
+                found_keyword = ""
+                found_at = -1
+                for keyword in keywords:
+                    found_at = text.find(keyword)
+                    if found_at >= 0:
+                        found_keyword = keyword
+                        break
+                if found_at < 0:
+                    found_at = 0
+                half = per_snippet // 2
+                start = max(0, found_at - half)
+                end = min(len(text), start + per_snippet)
+                start = max(0, end - per_snippet)
+                snippet_text = text[start:end].strip()
+                remaining = max_total - total_chars
+                if remaining <= 0:
+                    break
+                if len(snippet_text) > remaining:
+                    snippet_text = snippet_text[:remaining].rstrip()
+                if not snippet_text:
+                    continue
+                snippets.append(
+                    {
+                        "request_id": request_item.get("request_id"),
+                        "target_field": request_item.get("target_field", ""),
+                        "reason": request_item.get("reason", ""),
+                        "chunk_id": chunk.get("chunk_id"),
+                        "chapter_ids": chunk.get("chapter_ids", []),
+                        "keyword": found_keyword,
+                        "text": snippet_text,
+                    }
+                )
+                total_chars += len(snippet_text)
+                added += 1
+            if added == 0:
+                unresolved.append({**request_item, "reason": "匹配到切片但无法生成非空片段"})
+        return {
+            "requests": requests,
+            "snippets": snippets,
+            "unresolved_requests": unresolved,
+            "total_chars": total_chars,
+        }
+
+    def _group_book_analysis_level1_results(
+        self,
+        level1_results: list[dict[str, Any]],
+        *,
+        group_size: int = 3,
+        max_group_chars: int = 30000,
+    ) -> list[list[dict[str, Any]]]:
+        if not level1_results:
+            return []
+        size = max(1, int(group_size))
+        char_budget = max(6000, int(max_group_chars))
+        groups: list[list[dict[str, Any]]] = []
+        current: list[dict[str, Any]] = []
+        current_chars = 2
+        for item in level1_results:
+            record = item if isinstance(item, dict) else {"value": str(item)}
+            record_chars = len(json.dumps([record], ensure_ascii=False))
+            if record_chars > char_budget:
+                compacted = self._compact_analysis_value_for_level3(record, text_limit=120, item_limit=6)
+                if isinstance(compacted, dict):
+                    record = compacted
+                    record_chars = len(json.dumps([record], ensure_ascii=False))
+            if current and (len(current) >= size or current_chars + record_chars > char_budget):
+                groups.append(current)
+                current = []
+                current_chars = 2
+            current.append(record)
+            current_chars = len(json.dumps(current, ensure_ascii=False))
+        if current:
+            groups.append(current)
+        return groups
+
+    @classmethod
+    def _compact_book_analysis_level1_record_for_level2(cls, item: dict[str, Any]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key in ("level", "chunk_index", "total_chunks", "chunk_id", "chapter_ids"):
+            if key in item:
+                result[key] = item.get(key)
+        digest = cls._compact_text_for_level3(item.get("faithful_digest") or item.get("summary"), 900)
+        if digest:
+            result["faithful_digest"] = digest
+        list_limits = {
+            "key_events": (18, 180),
+            "character_clues": (24, 220),
+            "world_clues": (20, 220),
+            "chapter_updates": (36, 220),
+            "source_facts": (28, 240),
+            "conflicts": (10, 220),
+            "coverage_gaps": (10, 220),
+            "uncertainties": (10, 220),
+        }
+        for key, (item_limit, text_limit) in list_limits.items():
+            value = item.get(key)
+            if not isinstance(value, list) or not value:
+                continue
+            compacted = cls._compact_analysis_value_for_level3(
+                value,
+                text_limit=text_limit,
+                item_limit=item_limit,
+            )
+            if cls._analysis_value_has_content(compacted):
+                result[key] = compacted
+        return result
+
+    @classmethod
+    def _compact_book_analysis_level1_for_level2(
+        cls,
+        level1_results: list[dict[str, Any]],
+        *,
+        max_chars: int = 90000,
+    ) -> list[dict[str, Any]]:
+        compacted: list[dict[str, Any]] = []
+        max_chars = max(12000, int(max_chars))
+        for index, item in enumerate(level1_results):
+            if not isinstance(item, dict):
+                continue
+            record = cls._compact_book_analysis_level1_record_for_level2(item)
+            if not record:
+                continue
+            candidate = compacted + [record]
+            if len(json.dumps(candidate, ensure_ascii=False)) > max_chars:
+                compacted.append(
+                    {
+                        "compaction_note": "部分一级结果因二级上下文上限被截断，后续三级可通过 source_requests 回查原文。",
+                        "omitted_level1_chunks": len(level1_results) - index,
+                    }
+                )
+                break
+            compacted.append(record)
+        if not compacted:
+            compacted.append(
+                {
+                    "compaction_note": "一级结果为空或无法压缩，二级应只输出 coverage_gaps 供三级回查。",
+                    "original_level1_chunks": len(level1_results),
+                }
+            )
+        return compacted
+
+    @staticmethod
+    def _compact_text_for_level3(value: Any, limit: int = 420) -> str:
+        text = str(value or "").strip()
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 1)].rstrip() + "…"
+
+    @classmethod
+    def _compact_analysis_value_for_level3(
+        cls,
+        value: Any,
+        *,
+        text_limit: int = 420,
+        item_limit: int = 8,
+        depth: int = 0,
+    ) -> Any:
+        if value is None or isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value
+        if isinstance(value, str):
+            return cls._compact_text_for_level3(value, text_limit)
+        if isinstance(value, (list, tuple)):
+            return [
+                cls._compact_analysis_value_for_level3(
+                    item,
+                    text_limit=max(120, text_limit // 2),
+                    item_limit=max(3, item_limit // 2),
+                    depth=depth + 1,
+                )
+                for item in list(value)[:item_limit]
+            ]
+        if isinstance(value, dict):
+            if depth >= 3:
+                return cls._compact_text_for_level3(json.dumps(value, ensure_ascii=False), text_limit)
+            priority = (
+                "chapter_id",
+                "chapter_ids",
+                "chunk_id",
+                "chunk_ids",
+                "fact_id",
+                "fact_ids",
+                "source_fact_ids",
+                "name",
+                "role",
+                "subject",
+                "category",
+                "claim",
+                "rule",
+                "evidence",
+                "evidence_ref",
+                "evidence_refs",
+                "evidence_quote",
+                "evidence_quotes",
+                "source_quote",
+                "source_quotes",
+                "confidence",
+                "uncertainty",
+                "outline",
+                "events",
+                "ai_probability",
+                "ai_probability_level",
+                "goal",
+                "conflict",
+                "change",
+                "final_state",
+                "target_field",
+                "reason",
+            )
+            result: dict[str, Any] = {}
+            for key in priority:
+                if key in value:
+                    result[key] = cls._compact_analysis_value_for_level3(
+                        value.get(key),
+                        text_limit=text_limit,
+                        item_limit=item_limit,
+                        depth=depth + 1,
+                    )
+            for key, item in value.items():
+                if key in result or key in {"raw_text", "content", "full_text", "faithful_digest"}:
+                    continue
+                if len(result) >= 14:
+                    break
+                if not cls._analysis_value_has_content(item):
+                    continue
+                result[str(key)] = cls._compact_analysis_value_for_level3(
+                    item,
+                    text_limit=max(120, text_limit // 2),
+                    item_limit=max(3, item_limit // 2),
+                    depth=depth + 1,
+                )
+            return result
+        return cls._compact_text_for_level3(value, text_limit)
+
+    @classmethod
+    def _compact_book_analysis_level2_record_for_level3(cls, item: dict[str, Any]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        scalar_limits = {
+            "story_summary": 1200,
+            "summary": 900,
+            "group_summary": 900,
+        }
+        for key in ("level", "group_index", "total_groups"):
+            if key in item:
+                result[key] = item.get(key)
+        for key, limit in scalar_limits.items():
+            text = cls._compact_text_for_level3(item.get(key), limit)
+            if text:
+                result[key] = text
+        list_limits = {
+            "logic_chain": (18, 220),
+            "timeline": (22, 220),
+            "output_hints": (28, 220),
+            "character_arcs": (36, 260),
+            "world_model": (36, 260),
+            "chapter_updates": (80, 240),
+            "consolidated_facts": (70, 260),
+            "source_facts": (50, 240),
+            "facts": (50, 240),
+            "conflicts": (24, 220),
+            "coverage_gaps": (24, 220),
+        }
+        for key, (item_limit, text_limit) in list_limits.items():
+            value = item.get(key)
+            if not isinstance(value, list) or not value:
+                continue
+            compacted = cls._compact_analysis_value_for_level3(
+                value,
+                text_limit=text_limit,
+                item_limit=item_limit,
+            )
+            if cls._analysis_value_has_content(compacted):
+                result[key] = compacted
+        return result
+
+    @classmethod
+    def _compact_book_analysis_level2_for_level3(
+        cls,
+        level2_results: list[dict[str, Any]],
+        *,
+        max_chars: int = 45000,
+    ) -> list[dict[str, Any]]:
+        if not level2_results:
+            return []
+        compacted: list[dict[str, Any]] = []
+        max_chars = max(8000, int(max_chars))
+        for index, item in enumerate(level2_results):
+            if not isinstance(item, dict):
+                continue
+            record = cls._compact_book_analysis_level2_record_for_level3(item)
+            if not record:
+                continue
+            candidate = compacted + [record]
+            if len(json.dumps(candidate, ensure_ascii=False)) > max_chars:
+                remaining = len(level2_results) - index
+                compacted.append(
+                    {
+                        "compaction_note": "部分二级结果因三级上下文上限被截断，请必要时通过 source_requests 回查原文。",
+                        "omitted_level2_groups": remaining,
+                    }
+                )
+                break
+            compacted.append(record)
+        if not compacted:
+            compacted.append(
+                {
+                    "compaction_note": "二级结果为空或无法压缩，三级应主要依赖 source_index 与原文回查。",
+                    "original_level2_groups": len(level2_results),
+                }
+            )
+        return compacted
+
+    def _run_book_analysis_with_retries(
+        self,
+        *,
+        label: str,
+        call: Callable[[], dict[str, Any]],
+        max_retries: int,
+        log: Callable[[str], None],
+        cancel_event: Event | None,
+    ) -> dict[str, Any]:
+        for attempt in range(max_retries + 1):
+            if cancel_event and cancel_event.is_set():
+                raise RuntimeError("全书分析已取消。")
             try:
-                payload = ai_service.analyze_book(
-                    book_title=book_title,
-                    book_outline=book_outline,
-                    chapters=batch,
-                    characters=characters,
-                    world_entries=world_entries,
-                    require_remote=True,
-                )
+                return call()
             except Exception as exc:  # noqa: BLE001
-                merged["_meta"]["remote_failed_batches"] += 1
-                log(f"第 {batch_index} 批远程分析失败，使用本地结构兜底：{self._friendly_ai_error(str(exc))}")
-                payload = local_service.analyze_book(
-                    book_title=book_title,
-                    book_outline=book_outline,
-                    chapters=batch,
-                    characters=characters,
-                    world_entries=world_entries,
-                    require_remote=False,
-                )
-                for item in payload.get("chapter_updates", []):
-                    if isinstance(item, dict):
-                        item["_local_fallback"] = True
-            if cancel_event and cancel_event.is_set():
-                log("全书分析已停止，当前批次结果将被丢弃。")
-                break
-            merged["_meta"]["processed_chapters"] += len(batch)
-            self._merge_book_analysis_payload(merged, payload)
-        return merged
+                friendly = self._friendly_ai_error(str(exc))
+                if attempt < max_retries:
+                    log(f"{label}远程分析失败，正在重试 {attempt + 1}/{max_retries}：{friendly}")
+                    continue
+                raise RuntimeError(f"{label}远程分析失败，已重试 {max_retries} 次：{friendly}") from exc
+        raise RuntimeError(f"{label}远程分析失败。")
+
+    def _run_book_analysis_parallel_stage(
+        self,
+        *,
+        stage_label: str,
+        items: list[Any],
+        worker: Callable[[int, Any], dict[str, Any]],
+        max_workers: int,
+        max_retries: int,
+        log: Callable[[str], None],
+        cancel_event: Event | None,
+    ) -> list[dict[str, Any]]:
+        if not items:
+            return []
+        results: list[dict[str, Any] | None] = [None] * len(items)
+        worker_count = max(1, min(int(max_workers), len(items)))
+
+        def run_one(index: int, item: Any) -> dict[str, Any]:
+            return self._run_book_analysis_with_retries(
+                label=f"{stage_label} {index + 1}/{len(items)}",
+                call=lambda: worker(index, item),
+                max_retries=max_retries,
+                log=log,
+                cancel_event=cancel_event,
+            )
+
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="book-analysis") as executor:
+            pending: dict[Any, int] = {}
+            next_index = 0
+
+            def submit_ready() -> None:
+                nonlocal next_index
+                while next_index < len(items) and len(pending) < worker_count:
+                    if cancel_event and cancel_event.is_set():
+                        return
+                    log(f"全书分析：{stage_label} {next_index + 1}/{len(items)} 开始。")
+                    future = executor.submit(run_one, next_index, items[next_index])
+                    pending[future] = next_index
+                    next_index += 1
+
+            submit_ready()
+            while pending:
+                if cancel_event and cancel_event.is_set():
+                    for future in pending:
+                        future.cancel()
+                    raise RuntimeError("全书分析已取消。")
+                done, _not_done = wait(pending.keys(), timeout=0.2, return_when=FIRST_COMPLETED)
+                if not done:
+                    continue
+                for future in done:
+                    index = pending.pop(future)
+                    results[index] = future.result()
+                    log(f"全书分析：{stage_label} {index + 1}/{len(items)} 完成。")
+                submit_ready()
+        return [item for item in results if isinstance(item, dict)]
+
+    @staticmethod
+    def _analysis_world_text(payload: dict[str, Any]) -> str:
+        for key in (
+            "world_text",
+            "world_markdown",
+            "worldview_markdown",
+            "world_setting_markdown",
+            "world_settings_markdown",
+            "world_form",
+            "world",
+            "worldview",
+            "world_setting",
+            "world_settings",
+            "world_summary",
+            "世界观",
+        ):
+            value = payload.get(key)
+            if isinstance(value, dict):
+                text = NovelQtMainWindow._analysis_world_dict_text(value)
+                if text:
+                    return text
+                continue
+            if isinstance(value, (list, tuple)):
+                continue
+            text = str(value or "").strip()
+            if text.startswith("{"):
+                try:
+                    parsed = json.loads(text)
+                except (TypeError, ValueError):
+                    parsed = None
+                if isinstance(parsed, dict):
+                    parsed_text = NovelQtMainWindow._analysis_world_dict_text(parsed)
+                    if parsed_text:
+                        return parsed_text
+                    continue
+            if text:
+                return text
+        return ""
+
+    @staticmethod
+    def _analysis_world_schema_field_ids() -> set[str]:
+        field_ids: set[str] = set()
+        for section in WORLD_FORM_SCHEMA:
+            for item in section.get("items", []):
+                if isinstance(item, dict) and item.get("id"):
+                    field_ids.add(str(item["id"]))
+        return field_ids
+
+    @staticmethod
+    def _analysis_world_dict_text(value: dict[str, Any]) -> str:
+        field_ids = NovelQtMainWindow._analysis_world_schema_field_ids()
+        if isinstance(value.get("fields"), dict) or any(str(key) in field_ids for key in value.keys()):
+            return ""
+        lines: list[str] = []
+        ignored = {"id", "book_id", "created_at", "updated_at"}
+        for key, item in value.items():
+            if key in ignored or item is None:
+                continue
+            if isinstance(item, (dict, list, tuple)):
+                item_text = json.dumps(item, ensure_ascii=False)
+            else:
+                item_text = str(item or "").strip()
+            if item_text:
+                lines.append(f"{key}: {item_text}")
+        return "\n".join(lines).strip()
+
+    def _analysis_world_form(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        field_ids = self._analysis_world_schema_field_ids()
+        for key in (
+            "world_form",
+            "world_data",
+            "world_data_json",
+            "world_fields",
+            "worldview_form",
+            "world_setting_form",
+            "world_settings_form",
+            "world",
+            "worldview",
+            "world_setting",
+            "world_settings",
+            "世界观",
+        ):
+            if key not in payload:
+                continue
+            parsed = self._analysis_json_dict(payload.get(key))
+            if parsed is not None and (
+                isinstance(parsed.get("fields"), dict)
+                or isinstance(parsed.get("supplements"), list)
+                or any(str(field_key) in field_ids for field_key in parsed.keys())
+            ):
+                return parsed
+        if any(str(key) in field_ids for key in payload.keys()):
+            return payload
+        return None
+
+    @staticmethod
+    def _analysis_first_text(item: dict[str, Any], keys: tuple[str, ...]) -> str:
+        for key in keys:
+            value = item.get(key)
+            if isinstance(value, (dict, list, tuple)):
+                continue
+            text = str(value or "").strip()
+            if text:
+                return text
+        return ""
+
+    @staticmethod
+    def _analysis_json_dict(value: Any) -> dict[str, Any] | None:
+        if isinstance(value, dict):
+            return value
+        if not isinstance(value, str):
+            return None
+        text = value.strip()
+        if not text or not text.startswith("{"):
+            return None
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    @staticmethod
+    def _analysis_character_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
+        for key in (
+            "characters",
+            "character_cards",
+            "character_profiles",
+            "character_profile",
+            "character_data",
+            "人物卡",
+            "角色卡",
+            "人物",
+        ):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+            if isinstance(value, dict):
+                if any(
+                    marker in value
+                    for marker in (
+                        "name",
+                        "character_name",
+                        "profile_form",
+                        "profile_data",
+                        "profile_data_json",
+                        "profile_text",
+                        "profile_markdown",
+                    )
+                ):
+                    return [value]
+                records: list[dict[str, Any]] = []
+                for name, record in value.items():
+                    if isinstance(record, dict):
+                        item = dict(record)
+                        item.setdefault("name", str(name))
+                        records.append(item)
+                    else:
+                        text = str(record or "").strip()
+                        if text:
+                            records.append({"name": str(name), "profile_text": text})
+                if records:
+                    return records
+        return []
+
+    @staticmethod
+    def _analysis_character_schema_field_ids(role: str, schema_key: str = "") -> set[str]:
+        field_ids: set[str] = set()
+        for section in character_profile_schema_for_role(role, schema_key):
+            for item in section.get("items", []):
+                if isinstance(item, dict) and item.get("id"):
+                    field_ids.add(str(item["id"]))
+        return field_ids
+
+    def _analysis_character_profile_form(self, item: dict[str, Any], role: str) -> dict[str, Any] | None:
+        for key in (
+            "character_form",
+            "character_profile_form",
+            "profile_form",
+            "profile_data",
+            "profile_data_json",
+            "character_profile",
+            "profile_fields",
+            "fields",
+            "form",
+            "profile",
+        ):
+            if key not in item:
+                continue
+            parsed = self._analysis_json_dict(item.get(key))
+            if parsed is not None:
+                return parsed
+        schema_key = str(item.get("schema", "") or item.get("profile_schema", "") or "")
+        field_ids = self._analysis_character_schema_field_ids(role, schema_key)
+        if any(str(key) in field_ids for key in item.keys()):
+            return item
+        return None
+
+    @staticmethod
+    def _analysis_character_profile_text(item: dict[str, Any]) -> str:
+        for key in (
+            "profile_text",
+            "profile_markdown",
+            "markdown",
+            "content",
+            "description",
+            "summary",
+            "profile",
+        ):
+            value = item.get(key)
+            if isinstance(value, (dict, list, tuple)):
+                continue
+            text = str(value or "").strip()
+            if text:
+                return text
+        return ""
+
+    @staticmethod
+    def _book_analysis_requires_evidence(payload: dict[str, Any]) -> bool:
+        if bool(payload.get("_requires_evidence")):
+            return True
+        meta = payload.get("_meta", {})
+        return isinstance(meta, dict) and str(meta.get("analysis_pipeline", "")).startswith("three_level_pyramid_v2")
+
+    @staticmethod
+    def _analysis_value_has_content(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return True
+        if isinstance(value, str):
+            return bool(value.strip())
+        if isinstance(value, dict):
+            return any(NovelQtMainWindow._analysis_value_has_content(item) for item in value.values())
+        if isinstance(value, (list, tuple, set)):
+            return any(NovelQtMainWindow._analysis_value_has_content(item) for item in value)
+        return value is not None
+
+    @staticmethod
+    def _analysis_has_evidence(value: Any) -> bool:
+        if not isinstance(value, dict):
+            if isinstance(value, (list, tuple)):
+                return any(NovelQtMainWindow._analysis_has_evidence(item) for item in value)
+            return False
+        evidence_keys = {
+            "evidence_refs",
+            "evidence_ref",
+            "source_quotes",
+            "source_quote",
+            "evidence_quotes",
+            "evidence_quote",
+            "evidence",
+            "fact_id",
+            "fact_ids",
+            "chunk_id",
+            "chunk_ids",
+            "source_fact_ids",
+            "source",
+            "sources",
+        }
+        for key in evidence_keys:
+            if key in value and NovelQtMainWindow._analysis_value_has_content(value.get(key)):
+                return True
+        return any(NovelQtMainWindow._analysis_has_evidence(item) for item in value.values())
+
+    @staticmethod
+    def _analysis_has_direct_evidence(value: Any) -> bool:
+        if not isinstance(value, dict):
+            return False
+        direct_keys = {
+            "evidence_refs",
+            "evidence_ref",
+            "source_quotes",
+            "source_quote",
+            "evidence_quotes",
+            "evidence_quote",
+            "evidence",
+            "fact_id",
+            "fact_ids",
+            "chunk_id",
+            "chunk_ids",
+            "source_fact_ids",
+            "source",
+            "sources",
+        }
+        return any(
+            key in value and NovelQtMainWindow._analysis_value_has_content(value.get(key))
+            for key in direct_keys
+        )
+
+    @staticmethod
+    def _analysis_field_has_written_content(field: dict[str, Any]) -> bool:
+        if bool(field.get("checked", False)):
+            return True
+        if str(field.get("value", "") or "").strip():
+            return True
+        return False
+
+    @staticmethod
+    def _analysis_form_has_content(form: dict[str, Any] | None) -> bool:
+        if not isinstance(form, dict):
+            return False
+        fields = form.get("fields", {})
+        if isinstance(fields, dict):
+            for field in fields.values():
+                if isinstance(field, dict) and NovelQtMainWindow._analysis_field_has_written_content(field):
+                    return True
+        for plan in form.get("volume_plans", []) if isinstance(form.get("volume_plans"), list) else []:
+            if not isinstance(plan, dict):
+                continue
+            plan_fields = plan.get("fields", {})
+            if isinstance(plan_fields, dict):
+                for field in plan_fields.values():
+                    if isinstance(field, dict) and str(field.get("value", "") or "").strip():
+                        return True
+        supplements = form.get("supplements", [])
+        if isinstance(supplements, list):
+            for supplement in supplements:
+                if isinstance(supplement, dict) and str(supplement.get("content", "") or "").strip():
+                    return True
+        return False
+
+    def _prune_untrusted_analysis_form(self, form: dict[str, Any]) -> tuple[dict[str, Any], int]:
+        pruned = deepcopy(form)
+        dropped = 0
+        fields = pruned.get("fields", {})
+        if isinstance(fields, dict):
+            for field_id in list(fields.keys()):
+                field = fields.get(field_id)
+                if not isinstance(field, dict):
+                    fields.pop(field_id, None)
+                    continue
+                if not self._analysis_field_has_written_content(field):
+                    fields.pop(field_id, None)
+                    continue
+                if not self._analysis_has_evidence(field):
+                    fields.pop(field_id, None)
+                    dropped += 1
+        volume_plans = pruned.get("volume_plans", [])
+        if isinstance(volume_plans, list):
+            kept_plans: list[dict[str, Any]] = []
+            for plan in volume_plans:
+                if not isinstance(plan, dict):
+                    continue
+                plan_copy = deepcopy(plan)
+                plan_fields = plan_copy.get("fields", {})
+                if isinstance(plan_fields, dict):
+                    for field_id in list(plan_fields.keys()):
+                        field = plan_fields.get(field_id)
+                        if not isinstance(field, dict) or not str(field.get("value", "") or "").strip():
+                            plan_fields.pop(field_id, None)
+                            continue
+                        if not self._analysis_has_evidence(field):
+                            plan_fields.pop(field_id, None)
+                            dropped += 1
+                if self._analysis_form_has_content({"fields": {}, "volume_plans": [plan_copy], "supplements": []}):
+                    kept_plans.append(plan_copy)
+            pruned["volume_plans"] = kept_plans
+        supplements = pruned.get("supplements", [])
+        if isinstance(supplements, list):
+            kept_supplements: list[dict[str, Any]] = []
+            for supplement in supplements:
+                if not isinstance(supplement, dict):
+                    continue
+                if not str(supplement.get("content", "") or "").strip():
+                    continue
+                if self._analysis_has_evidence(supplement):
+                    kept_supplements.append(supplement)
+                else:
+                    dropped += 1
+            pruned["supplements"] = kept_supplements
+        return pruned, dropped
+
+    def _overlay_sparse_analysis_form(self, base: dict[str, Any] | None, incoming: dict[str, Any]) -> dict[str, Any]:
+        result = deepcopy(base) if isinstance(base, dict) else {}
+        for key in ("version", "schema", "name", "role"):
+            if key in incoming and str(incoming.get(key, "") or "").strip():
+                result[key] = incoming[key]
+        incoming_fields = incoming.get("fields", {})
+        if isinstance(incoming_fields, dict):
+            result_fields = result.setdefault("fields", {})
+            if not isinstance(result_fields, dict):
+                result["fields"] = result_fields = {}
+            for field_id, field in incoming_fields.items():
+                if not isinstance(field, dict):
+                    continue
+                target = result_fields.setdefault(str(field_id), {})
+                if not isinstance(target, dict):
+                    target = {}
+                    result_fields[str(field_id)] = target
+                if "checked" in field:
+                    target["checked"] = bool(field.get("checked", False))
+                if "value" in field:
+                    target["value"] = str(field.get("value", "") or "")
+        incoming_plans = incoming.get("volume_plans", [])
+        if isinstance(incoming_plans, list):
+            result_plans = result.setdefault("volume_plans", [])
+            if not isinstance(result_plans, list):
+                result["volume_plans"] = result_plans = []
+            by_id = {str(plan.get("volume_id", "")): plan for plan in result_plans if isinstance(plan, dict)}
+            for incoming_plan in incoming_plans:
+                if not isinstance(incoming_plan, dict):
+                    continue
+                key = str(incoming_plan.get("volume_id", ""))
+                target_plan = by_id.get(key)
+                if target_plan is None:
+                    target_plan = {
+                        "volume_id": incoming_plan.get("volume_id", len(result_plans) + 1),
+                        "volume_title": incoming_plan.get("volume_title", ""),
+                        "sort_order": incoming_plan.get("sort_order", len(result_plans) + 1),
+                        "fields": {},
+                    }
+                    result_plans.append(target_plan)
+                    by_id[key] = target_plan
+                target_fields = target_plan.setdefault("fields", {})
+                if not isinstance(target_fields, dict):
+                    target_plan["fields"] = target_fields = {}
+                incoming_fields = incoming_plan.get("fields", {})
+                if not isinstance(incoming_fields, dict):
+                    continue
+                for field_id, field in incoming_fields.items():
+                    if isinstance(field, dict) and "value" in field:
+                        target_fields[str(field_id)] = {"value": str(field.get("value", "") or "")}
+        incoming_supplements = incoming.get("supplements", [])
+        if isinstance(incoming_supplements, list):
+            result_supplements = result.setdefault("supplements", [])
+            if not isinstance(result_supplements, list):
+                result["supplements"] = result_supplements = []
+            existing = {
+                (str(item.get("title", "") or ""), str(item.get("content", "") or ""))
+                for item in result_supplements
+                if isinstance(item, dict)
+            }
+            for supplement in incoming_supplements:
+                if not isinstance(supplement, dict):
+                    continue
+                marker = (str(supplement.get("title", "") or ""), str(supplement.get("content", "") or ""))
+                if marker not in existing:
+                    result_supplements.append(supplement)
+                    existing.add(marker)
+        return result
+
+    def _filter_untrusted_book_analysis_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if not self._book_analysis_requires_evidence(payload):
+            return payload
+        filtered = deepcopy(payload)
+        dropped = 0
+        unresolved = filtered.get("analysis_unresolved", [])
+        if not isinstance(unresolved, list):
+            unresolved = []
+        for key in ("book_outline_form", "world_form"):
+            value = filtered.get(key)
+            if isinstance(value, dict):
+                pruned, count = self._prune_untrusted_analysis_form(value)
+                dropped += count
+                if self._analysis_form_has_content(pruned):
+                    filtered[key] = pruned
+                else:
+                    filtered.pop(key, None)
+        if filtered.get("book_outline") and not self._analysis_has_direct_evidence(filtered):
+            filtered.pop("book_outline", None)
+            dropped += 1
+        if filtered.get("world_text") and not self._analysis_has_direct_evidence(filtered):
+            filtered.pop("world_text", None)
+            dropped += 1
+
+        characters = self._analysis_character_items(filtered)
+        if characters:
+            kept_characters: list[dict[str, Any]] = []
+            for item in characters:
+                role = self._analysis_first_text(item, ("role", "character_role", "position", "定位", "角色定位"))
+                profile_form = self._analysis_character_profile_form(item, role)
+                item_copy = deepcopy(item)
+                has_trusted_content = False
+                if isinstance(profile_form, dict):
+                    pruned_form, count = self._prune_untrusted_analysis_form(profile_form)
+                    dropped += count
+                    for key in ("character_form", "character_profile_form", "profile_form", "profile_data", "profile_data_json", "character_profile", "profile_fields", "fields", "form", "profile"):
+                        if key in item_copy:
+                            item_copy.pop(key, None)
+                    if self._analysis_form_has_content(pruned_form):
+                        item_copy["profile_form"] = pruned_form
+                        has_trusted_content = True
+                profile_text = self._analysis_character_profile_text(item)
+                if profile_text:
+                    if self._analysis_has_evidence(item):
+                        item_copy["profile_text"] = profile_text
+                        has_trusted_content = True
+                    else:
+                        item_copy.pop("profile_text", None)
+                        item_copy.pop("profile_markdown", None)
+                        dropped += 1
+                if has_trusted_content:
+                    kept_characters.append(item_copy)
+                else:
+                    dropped += 1
+            filtered["characters"] = kept_characters
+            for key in ("character_cards", "character_profiles", "character_profile", "character_data"):
+                filtered.pop(key, None)
+
+        chapter_items = filtered.get("chapter_updates", [])
+        if isinstance(chapter_items, list):
+            kept_updates: list[dict[str, Any]] = []
+            for item in chapter_items:
+                if isinstance(item, dict) and self._analysis_has_evidence(item):
+                    kept_updates.append(item)
+                elif isinstance(item, dict):
+                    dropped += 1
+            filtered["chapter_updates"] = kept_updates
+        if dropped:
+            unresolved.append({"title": "证据门禁剔除", "content": f"{dropped} 个字段或条目缺少证据，未写入。"})
+        filtered["analysis_unresolved"] = unresolved
+        meta = filtered.get("_meta", {})
+        if not isinstance(meta, dict):
+            meta = {}
+        meta["evidence_gate_dropped"] = dropped
+        filtered["_meta"] = meta
+        return filtered
 
     def _merge_book_analysis_payload(self, merged: dict[str, Any], payload: dict[str, Any]) -> None:
         outline = str(payload.get("book_outline", "") or "").strip()
         if outline:
             existing_outline = str(merged.get("book_outline", "") or "").strip()
             merged["book_outline"] = f"{existing_outline}\n\n{outline}".strip() if existing_outline else outline
+        outline_form = payload.get("book_outline_form")
+        if isinstance(outline_form, dict):
+            existing_form = merged.get("book_outline_form")
+            merged["book_outline_form"] = merge_book_outline_form(
+                existing_form if isinstance(existing_form, dict) else None,
+                outline_form,
+                "",
+            )
+        world_form = self._analysis_world_form(payload)
+        world_text = self._analysis_world_text(payload)
+        world_entries = payload.get("world_entries", [])
+        if isinstance(world_form, dict) or world_text or isinstance(world_entries, list):
+            existing_world_form = merged.get("world_form")
+            merged["world_form"] = merge_world_analysis_payload(
+                existing_world_form if isinstance(existing_world_form, dict) else None,
+                world_form=world_form,
+                world_entries=world_entries,
+                world_text=world_text,
+            )
 
         def merge_named_list(target_key: str, content_key: str) -> None:
-            incoming = payload.get(target_key, [])
+            incoming = self._analysis_character_items(payload) if target_key == "characters" else payload.get(target_key, [])
             if not isinstance(incoming, list):
                 return
             existing: dict[str, dict[str, Any]] = {
@@ -5759,8 +7547,35 @@ class NovelQtMainWindow(QMainWindow):
                 if current is None:
                     current = {"name": name}
                     existing[name] = current
+                role = self._analysis_first_text(item, ("role", "character_role", "position", "定位", "角色定位"))
+                if role and not str(current.get("role", "") or "").strip():
+                    current["role"] = role
+                profile_form = self._analysis_character_profile_form(item, role or str(current.get("role", "") or ""))
+                if isinstance(profile_form, dict):
+                    current["profile_form"] = merge_character_profile_form(
+                        current.get("profile_form") if isinstance(current.get("profile_form"), dict) else None,
+                        profile_form,
+                        name,
+                        role or str(current.get("role", "") or ""),
+                    )
+                profile_text = self._analysis_character_profile_text(item)
+                if profile_text:
+                    old = str(current.get("profile_text", "") or "").strip()
+                    if old and profile_text not in old:
+                        current["profile_text"] = f"{old}\n{profile_text}"
+                    elif not old or len(profile_text) > len(old):
+                        current["profile_text"] = profile_text
                 for key, value in item.items():
                     if key == "name":
+                        continue
+                    if key in {"character_form", "profile_form", "profile_data", "profile_data_json"} and isinstance(value, dict):
+                        old_form = current.get(key)
+                        current[key] = merge_character_profile_form(
+                            old_form if isinstance(old_form, dict) else None,
+                            value,
+                            name,
+                            str(current.get("role", item.get("role", "")) or ""),
+                        )
                         continue
                     text = str(value or "").strip()
                     if not text:
@@ -5773,7 +7588,6 @@ class NovelQtMainWindow(QMainWindow):
             merged[target_key] = list(existing.values())
 
         merge_named_list("characters", "profile_text")
-        merge_named_list("world_entries", "content_text")
 
         incoming_chapters = payload.get("chapter_updates", [])
         if not isinstance(incoming_chapters, list):
@@ -5797,7 +7611,7 @@ class NovelQtMainWindow(QMainWindow):
             outline = str(item.get("outline", "") or "").strip()
             if outline and (not current.get("outline") or len(outline) > len(str(current.get("outline", "")))):
                 current["outline"] = outline
-            for key in ("ai_probability", "ai_probability_level", "_local_fallback"):
+            for key in ("ai_probability", "ai_probability_level"):
                 if key in item:
                     current[key] = item[key]
             events = item.get("events", [])
@@ -5811,29 +7625,51 @@ class NovelQtMainWindow(QMainWindow):
         merged["chapter_updates"] = list(existing_updates.values())
 
     def _apply_book_analysis_result(self, book_id: int, payload: dict[str, Any]) -> None:
+        requires_evidence = self._book_analysis_requires_evidence(payload)
+        payload = self._filter_untrusted_book_analysis_payload(payload)
         book = self.database.get_book(book_id)
+        book_title = str(book["title"] or self.state.selected_book_title) if book else self.state.selected_book_title
         book_outline = str(payload.get("book_outline", "") or "").strip()
-        if book and book_outline:
-            existing_outline = str(book["outline_text"] or "").strip()
-            if book_outline not in existing_outline:
-                self.database.update_book_outline(book_id, self._merge_analysis_outline(existing_outline, book_outline))
+        if book:
+            volume_specs = self._book_outline_volume_specs(book_id)
+            outline_form = payload.get("book_outline_form")
+            if isinstance(outline_form, dict):
+                if requires_evidence:
+                    outline_data = self._overlay_sparse_analysis_form(
+                        self.database.get_book_outline_form(book_id),
+                        outline_form,
+                    )
+                else:
+                    outline_data = outline_form
+                outline_data = normalize_book_outline_form(outline_data, book_title, volume_specs)
+            elif book_outline:
+                if "# 书籍大纲模板" in book_outline or "## 1." in book_outline:
+                    outline_data = book_outline_markdown_to_form(book_outline, book_title, volume_specs)
+                else:
+                    outline_data = merge_book_outline_supplement(
+                        book_outline_form_defaults(book_title, volume_specs),
+                        book_title,
+                        book_outline,
+                        supplement_title=f"AI分析覆盖 · {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                    )
+            else:
+                outline_data = self.database.get_book_outline_form(book_id)
+            self.database.update_book_outline_form(book_id, normalize_book_outline_form(outline_data, book_title, volume_specs))
 
         existing_characters = {
             str(item["name"]).strip(): int(item["id"])
             for item in self.database.list_characters(book_id)
             if str(item["name"]).strip()
         }
-        character_items = payload.get("characters", [])
-        if not isinstance(character_items, list):
-            character_items = []
+        character_items = self._analysis_character_items(payload)
         for item in character_items:
             if not isinstance(item, dict):
                 continue
-            name = str(item.get("name", "")).strip()
+            name = self._analysis_first_text(item, ("name", "character_name", "姓名", "角色名"))
             if not name:
                 continue
-            role = str(item.get("role", "")).strip()
-            profile = str(item.get("profile_text", item.get("profile", ""))).strip()
+            role = self._analysis_first_text(item, ("role", "character_role", "position", "定位", "角色定位"))
+            profile = self._analysis_character_profile_text(item)
             character_id = existing_characters.get(name)
             if character_id is None:
                 character_id = self.database.create_character(book_id, name)
@@ -5842,46 +7678,54 @@ class NovelQtMainWindow(QMainWindow):
                 existing = self.database.get_character(character_id)
                 if existing:
                     role = role or str(existing["role"] or "")
-                    profile = profile or str(existing["profile_text"] or "")
-            self.database.update_character(character_id, name, role, profile, image_path=None)
-
-        existing_world = {
-            str(item["name"]).strip(): int(item["id"])
-            for item in self.database.list_world_entries(book_id)
-            if str(item["name"]).strip()
-        }
-        world_items = payload.get("world_entries", [])
-        if not isinstance(world_items, list):
-            world_items = []
-        for item in world_items:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("name", "")).strip()
-            if not name:
-                continue
-            category = str(item.get("category", "设定")).strip() or "设定"
-            content = str(item.get("content_text", item.get("content", ""))).strip()
-            entry_id = existing_world.get(name)
-            if entry_id is None:
-                entry_id = self.database.create_world_entry(book_id, name, category)
-                existing_world[name] = entry_id
+            profile_form = self._analysis_character_profile_form(item, role)
+            if isinstance(profile_form, dict):
+                if requires_evidence:
+                    profile_data = self._overlay_sparse_analysis_form(
+                        self.database.get_character_profile_form(character_id),
+                        profile_form,
+                    )
+                else:
+                    profile_data = profile_form
+                profile_data = normalize_character_profile_form(profile_data, name, role)
+            elif profile:
+                profile_data = character_profile_markdown_to_form(profile, name, role)
             else:
-                existing = self.database.get_world_entry(entry_id)
-                if existing:
-                    category = category or str(existing["category"] or "设定")
-                    old_content = str(existing["content_text"] or "").strip()
-                    if old_content and content and content not in old_content:
-                        content = f"{old_content}\n{content}"
-                    elif old_content and not content:
-                        content = old_content
-            self.database.update_world_entry(entry_id, name, category, content)
+                profile_data = character_profile_form_defaults(name, role)
+            self.database.update_character_form(character_id, name, role, profile_data, image_path=None)
+
+        world_form = self._analysis_world_form(payload)
+        world_text = self._analysis_world_text(payload)
+        world_entries = payload.get("world_entries", [])
+        if isinstance(world_form, dict):
+            if requires_evidence:
+                world_data = self._overlay_sparse_analysis_form(self.database.get_book_world_form(book_id), world_form)
+            else:
+                world_data = world_form
+            world_data = normalize_world_form(world_data)
+        elif world_text or (isinstance(world_entries, list) and world_entries):
+            combined_world_parts: list[str] = []
+            if world_text:
+                combined_world_parts.append(world_text)
+            if isinstance(world_entries, list):
+                for entry in world_entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    title = str(entry.get("name") or entry.get("title") or entry.get("category") or "世界观").strip()
+                    content = str(entry.get("content") or entry.get("description") or "").strip()
+                    if content:
+                        combined_world_parts.append(f"## {title}\n{content}")
+            world_data = world_markdown_to_form("\n\n".join(combined_world_parts))
+        else:
+            world_data = self.database.get_book_world_form(book_id)
+        self.database.update_book_world_form(book_id, world_data)
 
         chapter_items = payload.get("chapter_updates", [])
         if not isinstance(chapter_items, list):
             chapter_items = []
-        existing_events: dict[int, set[str]] = {}
+        existing_events: dict[int, list[int]] = {}
         for event in self.database.list_chapter_events(book_id):
-            existing_events.setdefault(int(event["chapter_id"]), set()).add(str(event["label"]).strip())
+            existing_events.setdefault(int(event["chapter_id"]), []).append(int(event["id"]))
         for item in chapter_items:
             if not isinstance(item, dict):
                 continue
@@ -5893,9 +7737,7 @@ class NovelQtMainWindow(QMainWindow):
             if not chapter or int(chapter["book_id"]) != book_id:
                 continue
             outline = str(item.get("outline", "")).strip()
-            local_fallback = bool(item.get("_local_fallback", False))
-            current_outline = str(chapter["outline"] or "").strip()
-            if outline and (not local_fallback or not current_outline):
+            if outline:
                 self.database.update_chapter(chapter_id, outline=outline, content=str(chapter["content"] or ""), summary_text="")
             probability = item.get("ai_probability")
             level = str(item.get("ai_probability_level", "none")).strip().lower()
@@ -5906,26 +7748,58 @@ class NovelQtMainWindow(QMainWindow):
                     pass
             events = item.get("events", [])
             if isinstance(events, list):
+                for event_id in existing_events.get(chapter_id, []):
+                    self.database.delete_chapter_event(event_id)
+                written: set[str] = set()
                 for event_label in events[:6]:
                     label = str(event_label).strip()
-                    known = existing_events.setdefault(chapter_id, set())
-                    if label and label not in known:
+                    if label and label not in written:
                         self.database.create_chapter_event(book_id, chapter_id, label)
-                        known.add(label)
+                        written.add(label)
 
+        self._sync_truth_files(book_id)
+        self._index_book_design_for_rag(book_id)
         self._load_library_tree(self.current_tree_key)
         self._refresh_drawer()
+        self._refresh_structured_markdown_views_after_analysis(book_id)
         if self.state.selected_chapter_id:
             self._load_chapter(self.state.selected_chapter_id)
         meta = payload.get("_meta", {}) if isinstance(payload.get("_meta", {}), dict) else {}
-        failed_batches = int(meta.get("remote_failed_batches", 0) or 0)
         processed = int(meta.get("processed_chapters", 0) or 0)
-        if failed_batches:
-            self._append_task_log(f"全书分析结果已写入作品库。处理 {processed} 章，{failed_batches} 批使用本地兜底。")
-        else:
-            self._append_task_log(f"全书分析结果已写入作品库。处理 {processed or len(chapter_items)} 章。")
+        unresolved_items = payload.get("analysis_unresolved", [])
+        if isinstance(unresolved_items, list) and unresolved_items:
+            self._append_task_log(f"全书分析待确认：{len(unresolved_items)} 项证据不足，未写入。")
+        self._append_task_log(f"全书分析结果已写入作品库。处理 {processed or len(chapter_items)} 章。")
         self._switch_drawer_tab("overview")
         self._update_word_count()
+
+    def _refresh_structured_markdown_views_after_analysis(self, book_id: int) -> None:
+        if self.state.selected_book_id != book_id:
+            return
+        if self.state.editor_scope_kind == "book":
+            book = self.database.get_book(book_id)
+            if book:
+                volume_specs = self._book_outline_volume_specs(book_id)
+                outline_data = self.database.get_book_outline_form(book_id)
+                outline = book_outline_form_to_markdown(outline_data, str(book["title"] or self.state.selected_book_title), volume_specs)
+                self.loading_editor = True
+                try:
+                    self.book_outline_form.set_data(outline_data, str(book["title"] or self.state.selected_book_title), volume_specs)
+                    self.outline_editor.setPlainText(outline)
+                finally:
+                    self.loading_editor = False
+                self._refresh_outline_markdown_preview()
+                if self.outline_markdown_stack.currentWidget() is self.outline_markdown_preview:
+                    self._set_markdown_view_mode("outline", True)
+                self._mark_clean()
+        if self.selected_character_id:
+            self._load_character_form(self.selected_character_id)
+            if self.character_markdown_stack.currentWidget() is self.character_profile_preview:
+                self._set_markdown_view_mode("character", True)
+        if hasattr(self, "world_form"):
+            self._load_world_form_for_book(book_id)
+            if self.world_markdown_stack.currentWidget() is self.world_content_preview:
+                self._set_markdown_view_mode("world", True)
 
     def _switch_drawer_tab(self, tab_key: str) -> None:
         index = self.drawer_tab_indexes.get(tab_key)
@@ -6288,9 +8162,14 @@ class NovelQtMainWindow(QMainWindow):
         lines.append("生成校验机制来源：借鉴多智能体长篇写作工作流，仅做机制级学习，不复用外部源码。")
         return "\n".join(line for line in lines if str(line).strip())[:14000]
 
-    def _build_truth_context(self, book_id: int, chapter_id: int | None = None) -> str:
+    def _build_truth_context(
+        self,
+        book_id: int,
+        chapter_id: int | None = None,
+        max_chars: int = 14000,
+    ) -> str:
         try:
-            return self.truth_manager.assemble_context(book_id, chapter_id)
+            return self.truth_manager.assemble_context(book_id, chapter_id, max_chars=max_chars)
         except Exception:
             return ""
 
@@ -6472,7 +8351,6 @@ class NovelQtMainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001
             self._append_task_log(f"创建插入章节失败：{exc}")
             return None
-        self._save_chapter_book_title_mapping(chapter_id)
         self._load_library_tree(("chapter", chapter_id, None))
         self._activate_tree_key(("chapter", chapter_id, None))
         return chapter_id
@@ -7118,9 +8996,55 @@ class NovelQtMainWindow(QMainWindow):
             self,
             profiles=self._ai_profiles(),
             purpose_labels=AI_PURPOSES,
+            request_retries=getattr(self, "ai_request_retries", DEFAULT_AI_REQUEST_RETRIES),
+            book_analysis_concurrency=getattr(self, "book_analysis_concurrency", DEFAULT_BOOK_ANALYSIS_CONCURRENCY),
+            book_analysis_fast_extra_body=getattr(
+                self,
+                "book_analysis_fast_extra_body",
+                DEFAULT_BOOK_ANALYSIS_FAST_EXTRA_BODY_JSON,
+            ),
+            book_analysis_final_extra_body=getattr(
+                self,
+                "book_analysis_final_extra_body",
+                DEFAULT_BOOK_ANALYSIS_FINAL_EXTRA_BODY_JSON,
+            ),
         )
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self._save_ai_settings(dialog.values())
+
+    def _open_prompt_settings(self) -> None:
+        values = normalize_prompt_overrides(getattr(self, "prompt_overrides", {}), PROMPT_SETTING_ENTRIES)
+        dialog = PromptSettingsDialog(self, entries=PROMPT_SETTING_ENTRIES, values=values)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._save_prompt_settings(dialog.result_values())
+
+    def _save_prompt_settings(self, values: dict[str, str]) -> None:
+        prompt_overrides = normalize_prompt_overrides(values, PROMPT_SETTING_ENTRIES)
+        self.prompt_overrides = prompt_overrides
+        if isinstance(getattr(self, "ai_settings", None), dict):
+            self.ai_settings["prompt_settings_version"] = PROMPT_SETTINGS_VERSION
+            self.ai_settings["prompt_overrides"] = prompt_overrides
+        self.ai_service.set_prompt_overrides(prompt_overrides)
+        profiles = self._ai_profiles()
+        try:
+            self._write_json_file(
+                self.ai_config_path,
+                self._build_stored_ai_settings(
+                    profiles,
+                    getattr(self, "ai_request_retries", DEFAULT_AI_REQUEST_RETRIES),
+                    getattr(self, "book_analysis_concurrency", DEFAULT_BOOK_ANALYSIS_CONCURRENCY),
+                    getattr(self, "book_analysis_fast_extra_body", DEFAULT_BOOK_ANALYSIS_FAST_EXTRA_BODY_JSON),
+                    getattr(self, "book_analysis_final_extra_body", DEFAULT_BOOK_ANALYSIS_FINAL_EXTRA_BODY_JSON),
+                    prompt_overrides,
+                ),
+            )
+        except (OSError, ValueError) as exc:
+            error(self, "提示词配置保存失败", str(exc))
+            return
+        self._set_status("Agent 与提示词配置已保存")
+
+    def _prompt_text(self, key: str, default: str = "") -> str:
+        return prompt_value(getattr(self, "prompt_overrides", {}), key, default)
 
     def _open_book_settings(self, book_id: int | None = None) -> None:
         book_id = book_id or self.state.selected_book_id
@@ -7645,17 +9569,29 @@ def _install_exception_popup(app: QApplication) -> None:
     sys.excepthook = show_exception
 
 
-def run_qt_app(database: Database, ai_service: SimpleAIService) -> int:
+def run_qt_app(
+    database: Database,
+    ai_service: SimpleAIService,
+    startup_splash: Any | None = None,
+) -> int:
     app = QApplication.instance() or QApplication([])
-    app.setApplicationName("Simple AI Novel App")
+    app.setApplicationName(APP_DISPLAY_NAME)
     _resolve_and_set_app_icon(app)
     _install_exception_popup(app)
+    if startup_splash is not None:
+        startup_splash.set_stage("正在构建工作台", "加载书库、编辑器与上下文系统")
     window = NovelQtMainWindow(database, ai_service)
     app_icon = app.windowIcon()
     if not app_icon.isNull():
         window.setWindowIcon(app_icon)
     if os.environ.get("SIMPLE_AI_NOVEL_QT_OFFSCREEN") != "1":
+        if startup_splash is not None:
+            startup_splash.set_stage("正在显示主窗口", "马上就绪")
         window.show()
+        if startup_splash is not None:
+            startup_splash.finish(window)
+    elif startup_splash is not None:
+        startup_splash.close()
     if os.environ.get("SIMPLE_AI_NOVEL_QT_SMOKE") == "1":
         QTimer.singleShot(50, app.quit)
     exit_code = int(app.exec())

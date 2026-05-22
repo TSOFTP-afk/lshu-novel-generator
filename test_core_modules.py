@@ -1,7 +1,10 @@
 """核心模块测试"""
 
+import json
 import os
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 from novel_app.core import (
     get_event_bus, subscribe, unsubscribe, publish,
     get_state_manager, register_state_property, get_state, set_state,
@@ -210,6 +213,54 @@ class TestAIServiceSafety(unittest.TestCase):
                 chapters=[{"title": "章", "content": "甲和乙同行。"}],
                 require_remote=True,
             )
+        with self.assertRaises(RuntimeError):
+            service.detect_chinese_typos("这是一段需要 AI 纠错的章节正文。", require_remote=True)
+
+    def test_post_chat_completion_merges_extra_body_and_can_omit_temperature(self):
+        service = SimpleAIService(api_key="sk-test", base_url="https://example.com/v1", model="model-test")
+        captured: dict[str, object] = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b'{"choices":[{"message":{"content":"ok"}}]}'
+
+        def fake_urlopen(req, timeout=120):
+            captured["payload"] = json.loads(req.data.decode("utf-8"))
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+        with patch("novel_app.ai_service.request.urlopen", fake_urlopen):
+            service._post_chat_completion(
+                [{"role": "user", "content": "hi"}],
+                temperature=None,
+                extra_body={"thinking": {"type": "enabled"}, "reasoning_effort": "high"},
+            )
+
+        payload = captured["payload"]
+        self.assertIsInstance(payload, dict)
+        self.assertNotIn("temperature", payload)
+        self.assertEqual(payload["thinking"], {"type": "enabled"})
+        self.assertEqual(payload["reasoning_effort"], "high")
+
+    def test_three_level_book_analysis_methods_require_remote(self):
+        service = SimpleAIService()
+        with self.assertRaises(RuntimeError):
+            service.analyze_book_level1(book_title="书", book_outline="", chunk_text="正文", chunk_index=1, total_chunks=1)
+        with self.assertRaises(RuntimeError):
+            service.analyze_book_level2(book_title="书", level1_results=[], group_index=1, total_groups=1)
+        with self.assertRaises(RuntimeError):
+            service.analyze_book_level3(
+                book_title="书",
+                book_outline="",
+                level2_results=[],
+                chapters=[],
+            )
 
     def test_detect_ai_probability_parses_remote_json(self):
         service = SimpleAIService(api_key="sk-test", base_url="https://example.com/v1", model="model-test")
@@ -220,6 +271,16 @@ class TestAIServiceSafety(unittest.TestCase):
         service._post_chat_completion = fake_post_chat_completion
         self.assertEqual(service.detect_ai_probability("测试正文" * 100), (77, "high"))
 
+    def test_remote_completion_without_choices_raises_clear_error(self):
+        service = SimpleAIService(api_key="sk-test", base_url="https://example.com/v1", model="model-test")
+
+        def fake_post_chat_completion(*args, **kwargs):
+            return {"choices": []}
+
+        service._post_chat_completion = fake_post_chat_completion
+        with self.assertRaisesRegex(RuntimeError, "AI 接口未返回 choices"):
+            service.detect_ai_probability("测试正文" * 100)
+
     def test_detect_ai_probability_normalizes_inconsistent_result(self):
         service = SimpleAIService(api_key="sk-test", base_url="https://example.com/v1", model="model-test")
 
@@ -229,6 +290,62 @@ class TestAIServiceSafety(unittest.TestCase):
         service._post_chat_completion = fake_post_chat_completion
         self.assertEqual(service.detect_ai_probability("测试正文" * 100), (0, "none"))
         self.assertEqual(service.detect_ai_probability("太短"), (0, "none"))
+
+    def test_json_object_payload_repairs_missing_commas(self):
+        service = SimpleAIService(api_key="sk-test", base_url="https://example.com/v1", model="model-test")
+        malformed = """
+        ```json
+        {
+          "story_summary": "第一段"
+          "logic_chain": [
+            "原因一"
+            "结果二"
+          ],
+          "chapter_updates": [
+            {"chapter_id": 1, "outline": "开端"}
+            {"chapter_id": 2, "outline": "推进"}
+          ],
+        }
+        ```
+        """
+
+        payload = service._extract_json_object_payload(malformed)
+
+        self.assertEqual(payload["story_summary"], "第一段")
+        self.assertEqual(payload["logic_chain"], ["原因一", "结果二"])
+        self.assertEqual(payload["chapter_updates"][1]["chapter_id"], 2)
+
+    def test_detect_chinese_typos_uses_original_text_offsets(self):
+        service = SimpleAIService(api_key="sk-test", base_url="https://example.com/v1", model="model-test")
+
+        def fake_post_chat_completion(*args, **kwargs):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '[{"wrong": "错字", "suggestion": "措辞", "confidence": 0.9}]'
+                        }
+                    }
+                ]
+            }
+
+        service._post_chat_completion = fake_post_chat_completion
+        text = "\n  第一行错字结束"
+        result = service.detect_chinese_typos(text, require_remote=True)
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["start"], text.index("错字"))
+        self.assertEqual(result[0]["end"], text.index("错字") + len("错字"))
+
+    def test_detect_chinese_typos_required_remote_rejects_malformed_json(self):
+        service = SimpleAIService(api_key="sk-test", base_url="https://example.com/v1", model="model-test")
+
+        def fake_post_chat_completion(*args, **kwargs):
+            return {"choices": [{"message": {"content": "没有返回 JSON"}}]}
+
+        service._post_chat_completion = fake_post_chat_completion
+        with self.assertRaises(RuntimeError):
+            service.detect_chinese_typos("这是一段需要 AI 纠错的章节正文。", require_remote=True)
 
     def test_stream_chat_parses_remote_chunks(self):
         service = SimpleAIService(api_key="sk-test", base_url="https://example.com/v1", model="model-test")
@@ -244,6 +361,21 @@ class TestAIServiceSafety(unittest.TestCase):
             "hello",
         )
 
+    def test_stream_chat_ignores_empty_choice_chunks(self):
+        service = SimpleAIService(api_key="sk-test", base_url="https://example.com/v1", model="model-test")
+
+        def fake_stream_chat_completion(*args, **kwargs):
+            yield {"choices": []}
+            yield {"usage": {"total_tokens": 8}}
+            yield {"choices": [{"delta": {"role": "assistant"}}]}
+            yield {"choices": [{"delta": {"content": "好"}}]}
+
+        service._stream_chat_completion = fake_stream_chat_completion
+        self.assertEqual(
+            "".join(service.stream_chat([{"role": "user", "content": "测试"}], require_remote=True)),
+            "好",
+        )
+
     def test_analyze_book_parses_remote_json(self):
         service = SimpleAIService(api_key="sk-test", base_url="https://example.com/v1", model="model-test")
 
@@ -252,7 +384,7 @@ class TestAIServiceSafety(unittest.TestCase):
                 "choices": [
                     {
                         "message": {
-                            "content": '{"characters": [{"name": "甲", "role": "主角", "profile_text": "测试"}], "world_entries": [], "chapter_updates": [{"chapter_id": 1, "outline": "新大纲", "ai_probability": 20, "ai_probability_level": "low", "events": ["开场"]}]}'
+                            "content": '{"characters": [{"name": "甲", "role": "主角", "profile_text": "测试"}], "world_form": {"fields": {"科技水平": "蒸汽工业"}}, "world_entries": [{"category": "规则", "content": "死亡会留下可交易的记忆。"}], "chapter_updates": [{"chapter_id": 1, "outline": "新大纲", "ai_probability": 20, "ai_probability_level": "low", "events": ["开场"]}]}'
                         }
                     }
                 ]
@@ -266,6 +398,8 @@ class TestAIServiceSafety(unittest.TestCase):
             require_remote=True,
         )
         self.assertEqual(result["characters"][0]["name"], "甲")
+        self.assertEqual(result["world_form"]["fields"]["科技水平"], "蒸汽工业")
+        self.assertEqual(result["world_entries"][0]["content"], "死亡会留下可交易的记忆。")
         self.assertEqual(result["chapter_updates"][0]["ai_probability_level"], "low")
 
     def test_multi_agent_review_parses_remote_json(self):
@@ -462,6 +596,27 @@ class TestSecureStorage(unittest.TestCase):
         if os.name == "nt":
             self.assertTrue(protected.startswith(DPAPI_PREFIX))
             self.assertNotEqual(protected, secret)
+
+
+class TestPackagingScripts(unittest.TestCase):
+    """打包脚本关键逻辑测试"""
+
+    def test_build_script_uses_base_python_and_source_pip(self):
+        source = Path("packaging/build_first_exe_fast.ps1").read_text(encoding="utf-8-sig")
+        self.assertIn("function Resolve-PythonRuntimeRoot", source)
+        self.assertIn("sys.base_prefix or sys.prefix", source)
+        self.assertIn("$RequirementsHash", source)
+        self.assertIn("Test-RuntimeCacheMatches", source)
+        self.assertIn("& $PythonExe -m pip install", source)
+        self.assertNotIn("$PayloadPip install", source)
+
+    def test_launcher_reuses_extracted_runtime_until_payload_changes(self):
+        source = Path("packaging/Launcher.cs").read_text(encoding="utf-8")
+        self.assertIn("EnsureInstallDir", source)
+        self.assertIn("BuildPayloadStamp", source)
+        self.assertIn("NeedsExtract", source)
+        ensure_method = source.split("private static string EnsureInstallDir", 1)[1].split("private static string BuildPayloadStamp", 1)[0]
+        self.assertNotIn("DeleteDir(dir)", ensure_method)
 
 
 if __name__ == "__main__":

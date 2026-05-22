@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from novel_app.truth import TruthManager
+from novel_app.truth.truth_manager import MAX_TRUTH_FILE_BYTES
 
 
 class FakeDB:
@@ -125,6 +126,13 @@ class TestTruthManager:
         assert "张三" in content
         assert "主角" in content
 
+    def test_current_state_includes_world_entries(self, truth_manager: TruthManager) -> None:
+        truth_manager.build_all(1)
+        content = truth_manager.read(1, "current_state.md")
+        assert "世界观设定" in content
+        assert "时间回溯" in content
+        assert "冷却时间限制" in content
+
     def test_character_matrix_includes_relationships(self, truth_manager: TruthManager) -> None:
         truth_manager.build_all(1)
         content = truth_manager.read(1, "character_matrix.md")
@@ -146,3 +154,12 @@ class TestTruthManager:
         truth_manager.build_all(1)
         content = truth_manager.read(1, "emotional_arcs.md")
         assert "张三" in content
+
+    def test_write_file_truncates_to_utf8_byte_limit(self, truth_manager: TruthManager) -> None:
+        content = "标题\n" + ("这是很长的中文内容" * 4000)
+        truth_manager._write_file(1, "current_state.md", content)
+
+        path = truth_manager._truth_dir(1) / "current_state.md"
+        written = path.read_text(encoding="utf-8")
+        assert written
+        assert len(written.encode("utf-8")) <= MAX_TRUTH_FILE_BYTES

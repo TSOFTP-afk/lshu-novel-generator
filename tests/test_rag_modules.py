@@ -10,6 +10,14 @@ from novel_app.rag.qdrant_client import QdrantLocalClient
 from novel_app.rag.retriever import ChapterRetriever
 
 
+class FixedEmbedder:
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return [[1.0, 0.0] for _text in texts]
+
+    def embed_single(self, text: str) -> list[float]:
+        return [1.0, 0.0]
+
+
 @pytest.fixture
 def temp_storage() -> str:
     with tempfile.TemporaryDirectory() as tmp:
@@ -106,6 +114,19 @@ class TestQdrantLocalClient:
         assert len(results) == 1
         assert results[0]["payload"]["title"] == "测试"
 
+    def test_special_collection_name_persists_with_safe_key(self, temp_storage: str) -> None:
+        client1 = QdrantLocalClient(temp_storage)
+        client1.create_collection("book:1", 3)
+        client1.upsert("book:1", [{"id": 1, "vector": [1.0, 0.0, 0.0], "payload": {"title": "测试"}}])
+
+        client2 = QdrantLocalClient(temp_storage)
+        assert client2.collection_exists("book:1")
+        assert client2.collection_exists("book_1")
+        assert client2.count("book:1") == 1
+        results = client2.search("book:1", [1.0, 0.0, 0.0])
+        assert len(results) == 1
+        assert results[0]["payload"]["title"] == "测试"
+
 
 class TestChapterRetriever:
     @pytest.fixture
@@ -136,13 +157,56 @@ class TestChapterRetriever:
         assert "觉醒" in context
         assert "第一章" in context
 
+    def test_build_context_returns_truncated_first_oversized_result(self, retriever: ChapterRetriever) -> None:
+        results = [
+            {
+                "id": 1,
+                "payload": {
+                    "title": "超长章节",
+                    "outline": "大纲" * 100,
+                    "summary": "摘要" * 100,
+                },
+            }
+        ]
+        context = retriever.build_context_from_results(results, max_chars=40)
+        assert context
+        assert len(context) <= 40
+        assert "超长章节" in context
+
     def test_remove_chapter(self, retriever: ChapterRetriever) -> None:
         retriever.remove_chapter(1, 1)
         results = retriever.search(1, "觉醒", top_k=3)
         assert not any(r["id"] == 1 for r in results)
+
+    def test_book_design_indexes_as_special_rag_document(self, retriever: ChapterRetriever) -> None:
+        retriever.index_book_design(1, "测试书", "# 书籍大纲模板\n\n## 1.2 篇幅与结构\n\n- [x] 长篇")
+        results = retriever.search(1, "长篇", top_k=5)
+        assert any(r["id"] == "book_design" for r in results)
+        context = retriever.build_context_from_results(results)
+        assert "书籍级设定" in context
+        retriever.remove_chapter(1, 1)
+        results_after_remove = retriever.search(1, "长篇", top_k=5)
+        assert any(r["id"] == "book_design" for r in results_after_remove)
 
     def test_search_recent_chapters(self, retriever: ChapterRetriever) -> None:
         results = retriever.search_recent_chapters(1, "真相", top_k=2)
         if results:
             ids = [r.get("id") for r in results]
             assert ids == sorted(ids, reverse=True)
+
+    def test_search_with_recency_weights_recency_once(self, temp_storage: str) -> None:
+        retriever = ChapterRetriever(temp_storage, embedder=FixedEmbedder(), vector_size=2)
+        retriever._client.create_collection("book_1", 2)
+        retriever._client.upsert(
+            "book_1",
+            [
+                {"id": 1, "vector": [1.0, 0.0], "payload": {"title": "旧章节"}},
+                {"id": 10, "vector": [1.0, 0.0], "payload": {"title": "新章节"}},
+            ],
+        )
+
+        results = retriever.search_with_recency(1, "任意查询", top_k=2, recency_bias=0.3)
+
+        assert [item["id"] for item in results] == [10, 1]
+        assert results[0]["score"] == pytest.approx(1.0)
+        assert results[1]["score"] == pytest.approx(0.73)
